@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IEUM Route Demo</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel">
+        <h1>IEUM 경로 데모</h1>
+        <form id="routeForm" class="form">
+          <label>
+            출발지
+            <input id="startInput" value="고덕로 210" autocomplete="off" />
+          </label>
+          <label>
+            도착지
+            <input id="endInput" value="잠실 롯데타워" autocomplete="off" />
+          </label>
+          <button type="submit">경로 찾기</button>
+        </form>
+        <div id="status" class="status">대기 중</div>
+        <section class="layers">
+          <h2>데이터 레이어</h2>
+          <label><input type="checkbox" data-layer="subway_line" checked /> 지하철 노선</label>
+          <label><input type="checkbox" data-layer="subway_station" checked /> 지하철역</label>
+          <label><input type="checkbox" data-layer="subway_elevator" /> 지하철 엘리베이터</label>
+          <label><input type="checkbox" data-layer="braille" /> 점자블록</label>
+          <label><input type="checkbox" data-layer="crosswalk" /> 횡단보도</label>
+          <label><input type="checkbox" data-layer="audible" /> 음향신호기</label>
+        </section>
+        <section class="instructions-panel">
+          <div class="panel-heading">
+            <h2>경로 안내 멘트</h2>
+            <button id="showTemplates" type="button">전체 멘트 목록</button>
+          </div>
+          <ol id="instructions" class="instructions"></ol>
+        </section>
+        <dl id="summary" class="summary"></dl>
+      </section>
+      <section id="map" class="map"></section>
+    </main>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

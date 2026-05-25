@@ -1,0 +1,203 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033;
+  background: #f4f6f8;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  height: 100vh;
+}
+
+.panel {
+  padding: 18px;
+  border-right: 1px solid #d8dde6;
+  background: #ffffff;
+  overflow: auto;
+}
+
+h1 {
+  margin: 0 0 18px;
+  font-size: 22px;
+  font-weight: 800;
+}
+
+.form {
+  display: grid;
+  gap: 12px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+input {
+  width: 100%;
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid #c7ced9;
+  border-radius: 6px;
+  font: inherit;
+}
+
+button {
+  height: 42px;
+  border: 0;
+  border-radius: 6px;
+  background: #14532d;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #166534;
+}
+
+.status {
+  margin-top: 16px;
+  padding: 10px;
+  border-radius: 6px;
+  background: #eef2f7;
+  font-size: 13px;
+}
+
+.layers,
+.instructions-panel {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.layers h2,
+.panel-heading h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.layers label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  font-weight: 700;
+}
+
+.layers input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+#showTemplates {
+  width: auto;
+  height: 32px;
+  padding: 0 10px;
+  background: #334155;
+  font-size: 12px;
+}
+
+.instructions {
+  margin: 12px 0 0;
+  padding-left: 0;
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  list-style: none;
+}
+
+.instructions li {
+  padding: 9px 10px;
+  border-left: 4px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.instructions strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #475569;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.instruction-walk_with_braille {
+  border-left-color: #d97706;
+  background: #fff7ed;
+}
+
+.instruction-crosswalk {
+  border-left-color: #e11d48;
+  background: #fff1f2;
+}
+
+.instruction-subway_ride,
+.instruction-subway_entry,
+.instruction-subway_internal {
+  border-left-color: #2563eb;
+  background: #eff6ff;
+}
+
+.summary {
+  display: grid;
+  grid-template-columns: 128px minmax(0, 1fr);
+  gap: 8px 10px;
+  margin: 16px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid #e5e7eb;
+  font-size: 13px;
+}
+
+.summary dt {
+  font-weight: 800;
+  color: #4b5563;
+}
+
+.summary dd {
+  margin: 0;
+  min-width: 0;
+  word-break: keep-all;
+}
+
+.map {
+  min-height: 100vh;
+}
+
+.leaflet-popup-content {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (max-width: 760px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .panel {
+    border-right: 0;
+    border-bottom: 1px solid #d8dde6;
+  }
+
+  .map {
+    min-height: 65vh;
+  }
+}

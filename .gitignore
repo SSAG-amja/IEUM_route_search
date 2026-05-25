@@ -1,0 +1,15 @@
+.env
+*.env
+
+__pycache__/
+*.py[cod]
+
+routing/ieum_graph.sqlite
+routing/ieum_graph.sqlite-*
+routing/results/
+
+data/*.geojson
+data/*.json
+
+.DS_Store
+Thumbs.db

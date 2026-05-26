@@ -96,13 +96,15 @@ Python 3.10 이상을 권장합니다. 서버 의존성을 설치합니다.
 python -m pip install -r requirements.txt
 ```
 
-Kakao 주소/장소명 검색을 쓰려면 `.env.example`을 참고해 `.env` 파일을 만듭니다.
+Kakao 주소/장소명 검색과 Gemini 음성 목적지 분석을 쓰려면 `.env.example`을 참고해 `.env` 파일을 만듭니다.
 
 ```text
 KAKAO_REST_API_KEY=your_kakao_rest_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-`.env`가 없으면 주소/장소명 검색은 제한됩니다. 좌표 직접 입력 테스트는 가능합니다.
+`.env`가 없으면 주소/장소명 검색과 Gemini 목적지 분석은 제한됩니다. 좌표 직접 입력 테스트는 가능합니다.
+서버 설정은 실행 위치와 셸 환경변수 여부에 관계없이 이 디렉터리의 `.env`를 우선 사용합니다.
 
 ## 실행 명령어
 

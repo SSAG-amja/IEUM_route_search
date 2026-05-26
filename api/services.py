@@ -23,9 +23,9 @@ from uuid import uuid4
 
 from .schemas import LocationInput, RouteCreateRequest, RouteLeg, RouteResponse, RouteStep
 
-load_dotenv()
-
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env", override=True)
+
 ROUTING_PATH = ROOT / "routing"
 WORKSPACE_ROOT = ROOT.parent
 NAV_DATA = WORKSPACE_ROOT / "nav_map" / "web" / "data"

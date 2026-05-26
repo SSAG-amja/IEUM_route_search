@@ -201,6 +201,8 @@ route(start_input, end_input):
 - 출발지/도착지와 지하철역 연결
 - 지하철 이용 경로 산출
 - 역 내부 이동 안내 멘트 생성
+- 승차역은 노선과 다음 역 방향(`lnCd`, `stinCd`, `nextStinCd`)을 기준으로 내부 이동동선을 선택
+- 환승역은 `환승경로` 이동동선을 우선 사용하고, 환승 후 노선/방면 문구를 반영
 
 ### 2.3 최종 통합 graph
 
@@ -355,7 +357,20 @@ data_gz/source/subway_station_catalog/merged_station_accessibility_catalog.json.
 - 역별 엘리베이터 이동동선 안내
 - 역사 내부 이동동선 안내
 - 출구/접근성 정보 안내
+- 시각장애인 음성유도기 설치 위치 안내 보강
 - 지하철 내부 안내 멘트 생성
+- `mvPathMgNo`, `mvTpOrdr`, `exitMvTpOrdr` 기준으로 같은 역내 이동경로를 묶고 순서대로 안내
+- 이동경로 이미지(`imgPath`)가 있는 경우 instruction payload에 함께 포함
+
+추가 보관 원천:
+
+```text
+data_gz/source/subway_station_catalog/seoul_metro_voice_guidance_devices_20250812.csv.gz
+```
+
+이 파일은 서울교통공사 지하철 시각장애인 음성유도기 설치 위치 정보 CSV를 gzip으로 보관한 것이다. 역명, 호선, 외부역번호, 설치위치 텍스트를 `merged_station_accessibility_catalog.json.gz`의 `voice_guidance_devices` 필드로 병합해 사용한다.
+
+역내 안내 생성 시에는 현재 이동 단계 문구와 `voice_guidance_devices.install_location`의 출구, 개찰구, 대합실, 승강장, 엘리베이터, 환승 관련 키워드를 비교해 관련 설치 위치만 짧게 안내한다. 정확한 실내 좌표/거리가 없는 데이터이므로 음성유도기 위치는 경로 자체가 아니라 보조 확인 지점으로 안내한다.
 
 #### 2.4.5 현재 경로 탐색에 직접 쓰지 않는 gz
 

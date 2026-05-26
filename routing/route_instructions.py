@@ -137,22 +137,136 @@ def naturalize_indoor_step(value: str) -> str:
     return text if text.endswith((".", "요")) else f"{text}로 이동하세요"
 
 
-def movement_steps(station_name: str, prefer: str = "elevator", limit: int = 5) -> list[str]:
-    station = subway_catalog_by_name().get(normalize_name(station_name))
+def location_tokens(value: str) -> set[str]:
+    text = normalize_name(value)
+    tokens: set[str] = set()
+    for pattern in (
+        r"\d+(?:,\d+)?번출구",
+        r"\d+번",
+        r"[상하내외]선",
+        r"[A-Z]계단",
+        r"\d+-\d+",
+        r"화장실",
+        r"개찰구",
+        r"대합실",
+        r"승강장",
+        r"엘리베이터",
+        r"EV",
+        r"E/V",
+        r"발매기",
+        r"환승",
+        r"갈아타",
+    ):
+        tokens.update(match.group(0) for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+    return tokens
+
+
+def voice_guidance_devices_for_station(station_name: str) -> list[dict[str, Any]]:
+    station = station_catalog(station_name)
     if not station:
         return []
-    field = "elevator_movements" if prefer == "elevator" else "station_movements"
-    records = station.get(field) or []
-    if not records and prefer == "elevator":
-        records = station.get("station_movements") or []
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    devices = station.get("voice_guidance_devices") or []
+    return [device for device in devices if isinstance(device, dict)]
+
+
+def related_voice_guidance_devices(
+    station_name: str,
+    context: str = "",
+    line_code: str | None = None,
+    limit: int = 3,
+    allow_fallback: bool = True,
+) -> list[dict[str, Any]]:
+    devices = voice_guidance_devices_for_station(station_name)
+    if line_code:
+        line_filtered = [device for device in devices if str(device.get("line_code") or "") == str(line_code)]
+        if line_filtered:
+            devices = line_filtered
+    if not devices:
+        return []
+
+    context_tokens = location_tokens(context)
+    scored: list[tuple[int, int, dict[str, Any]]] = []
+    for idx, device in enumerate(devices):
+        location = str(device.get("install_location") or "")
+        device_tokens = location_tokens(location)
+        score = len(context_tokens & device_tokens) * 10
+        normalized_location = normalize_name(location)
+        normalized_context = normalize_name(context)
+        if normalized_location and normalized_location in normalized_context:
+            score += 20
+        if "환승" in normalized_context and ("환승" in normalized_location or "갈아타" in normalized_location):
+            score += 8
+        if "엘리베이터" in normalized_context and ("EV" in device_tokens or "E/V" in device_tokens or "엘리베이터" in device_tokens):
+            score += 6
+        scored.append((score, -idx, device))
+    scored.sort(reverse=True)
+    selected = [device for score, _, device in scored if score > 0][:limit]
+    if selected:
+        return selected
+    if not allow_fallback:
+        return []
+
+    priority_words = ("출구", "개찰구", "대합실", "엘리베이터", "E/V", "화장실", "승강장")
+    fallback = [
+        device
+        for device in devices
+        if any(word in str(device.get("install_location") or "") for word in priority_words)
+    ]
+    return (fallback or devices)[:limit]
+
+
+def voice_guidance_text(devices: list[dict[str, Any]]) -> str:
+    locations = []
+    seen: set[str] = set()
+    for device in devices:
+        location = str(device.get("install_location") or "").strip()
+        if not location or location in seen:
+            continue
+        seen.add(location)
+        locations.append(location)
+    if not locations:
+        return ""
+    if len(locations) == 1:
+        return f"음성유도기는 {locations[0]}에 설치되어 있습니다."
+    return f"음성유도기는 {', '.join(locations)} 등에 설치되어 있습니다."
+
+
+def station_catalog(station_name: str) -> dict[str, Any] | None:
+    return subway_catalog_by_name().get(normalize_name(station_name))
+
+
+def station_api_code(station: dict[str, Any] | None, line_code: str | None) -> str | None:
+    if not station or not line_code:
+        return None
+    for line in station.get("lines") or []:
+        if str(line.get("line_code") or "") == str(line_code):
+            return str(line.get("api_station_code") or line.get("station_code") or "") or None
+    return None
+
+
+def movement_group_key(record: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(record.get("mvPathMgNo") or record.get("nextStinCd") or "0"),
+        str(record.get("imgPath") or ""),
+    )
+
+
+def movement_order(record: dict[str, Any]) -> int:
+    value = record.get("mvTpOrdr") or record.get("exitMvTpOrdr") or 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def selected_step_payload(records: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for record in records:
-        key = str(record.get("mvPathMgNo") or record.get("nextStinCd") or "0")
-        grouped[key].append(record)
+        grouped[movement_group_key(record)].append(record)
     if not grouped:
         return []
-    selected = sorted(grouped.values(), key=len, reverse=True)[0]
-    selected = sorted(selected, key=lambda item: int(item.get("mvTpOrdr") or item.get("exitMvTpOrdr") or 0))
+    selected = sorted(grouped.values(), key=lambda group: (len(group), -movement_order(group[0])), reverse=True)[0]
+    selected = sorted(selected, key=movement_order)
     steps = []
     seen: set[str] = set()
     for item in selected:
@@ -162,8 +276,117 @@ def movement_steps(station_name: str, prefer: str = "elevator", limit: int = 5) 
         if text in seen:
             continue
         seen.add(text)
-        steps.append(text)
+        steps.append(
+            {
+                "text": text,
+                "line_code": item.get("lnCd"),
+                "station_code": item.get("stinCd"),
+                "next_station_code": item.get("nextStinCd"),
+                "movement_path_id": item.get("mvPathMgNo"),
+                "movement_path_type": item.get("mvPathDvNm"),
+                "start_hint": item.get("stMovePath"),
+                "end_hint": item.get("edMovePath"),
+                "image_url": item.get("imgPath"),
+            }
+        )
     return steps[:limit]
+
+
+def movement_steps_payload(
+    station_name: str,
+    prefer: str = "elevator",
+    limit: int = 5,
+    line_code: str | None = None,
+    next_station_name: str | None = None,
+    transfer_to_line_code: str | None = None,
+    transfer_next_station_name: str | None = None,
+) -> list[dict[str, Any]]:
+    station = subway_catalog_by_name().get(normalize_name(station_name))
+    if not station:
+        return []
+    station_code = station_api_code(station, line_code)
+    next_station = station_catalog(next_station_name or "")
+    next_station_code = station_api_code(next_station, line_code) if next_station else None
+
+    if prefer == "transfer":
+        transfer_records = [
+            record
+            for record in station.get("elevator_movements") or []
+            if record.get("mvPathDvNm") == "환승경로"
+            and (not line_code or str(record.get("lnCd") or "") == str(line_code))
+            and (not station_code or str(record.get("stinCd") or "") == station_code)
+        ]
+        if transfer_to_line_code:
+            line_text = f"{transfer_to_line_code}호선"
+            direction_name = normalize_name(transfer_next_station_name or "")
+            direction_hint = direction_name[:2] if len(direction_name) >= 2 else direction_name
+            grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+            for record in transfer_records:
+                grouped[movement_group_key(record)].append(record)
+            scored_groups = []
+            for group in grouped.values():
+                text = " ".join(str(record.get("mvContDtl") or "") for record in group)
+                normalized = normalize_name(text)
+                score = 0
+                if line_text in text:
+                    score += 4
+                if direction_name and direction_name in normalized:
+                    score += 3
+                elif direction_hint and direction_hint in normalized:
+                    score += 2
+                scored_groups.append((score, len(group), group))
+            scored_groups = [item for item in scored_groups if item[0] > 0]
+            if scored_groups:
+                scored_groups.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                transfer_records = scored_groups[0][2]
+        if transfer_records:
+            return selected_step_payload(transfer_records, limit)
+
+    fields = ["station_movements", "elevator_movements"] if prefer == "station" else ["elevator_movements", "station_movements"]
+    for field in fields:
+        records = list(station.get(field) or [])
+        if prefer != "transfer":
+            normal_records = [record for record in records if record.get("mvPathDvNm") != "환승경로"]
+            if normal_records:
+                records = normal_records
+        if line_code:
+            line_filtered = [record for record in records if str(record.get("lnCd") or "") == str(line_code)]
+            if line_filtered:
+                records = line_filtered
+        if station_code:
+            station_filtered = [record for record in records if str(record.get("stinCd") or "") == station_code]
+            if station_filtered:
+                records = station_filtered
+        if next_station_code:
+            direction_filtered = [record for record in records if str(record.get("nextStinCd") or "") == next_station_code]
+            if direction_filtered:
+                records = direction_filtered
+        if records:
+            return selected_step_payload(records, limit)
+    return []
+
+
+def movement_steps(
+    station_name: str,
+    prefer: str = "elevator",
+    limit: int = 5,
+    line_code: str | None = None,
+    next_station_name: str | None = None,
+    transfer_to_line_code: str | None = None,
+    transfer_next_station_name: str | None = None,
+) -> list[str]:
+    return [
+        step["text"]
+        for step in movement_steps_payload(
+            station_name,
+            prefer=prefer,
+            limit=limit,
+            line_code=line_code,
+            next_station_name=next_station_name,
+            transfer_to_line_code=transfer_to_line_code,
+            transfer_next_station_name=transfer_next_station_name,
+        )
+    ]
 
 
 def instruction(item_type: str, text: str, **extra: Any) -> dict[str, Any]:
@@ -300,6 +523,34 @@ def has_subway_ride_before_outdoor(groups: list[list[dict[str, Any]]], start_ind
     return False
 
 
+def subway_segment(group: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not group:
+        return None
+    first_props = group[0].get("properties") or {}
+    if first_props.get("edge_type") != "subway_ride":
+        return None
+    last_props = group[-1].get("properties") or {}
+    line_code = str(first_props.get("line_code") or "")
+    line_name = str(first_props.get("line_name") or f"{line_code}호선")
+    return {
+        "line_code": line_code,
+        "line_name": line_name,
+        "from_station": station_name_from_node(first_props.get("route_from_node"), first_props.get("route_from_node_id")),
+        "to_station": station_name_from_node(last_props.get("route_to_node"), last_props.get("route_to_node_id")),
+        "next_station": station_name_from_node(first_props.get("route_to_node"), first_props.get("route_to_node_id")),
+    }
+
+
+def nearest_subway_segment(groups: list[list[dict[str, Any]]], start_index: int, step: int) -> dict[str, Any] | None:
+    index = start_index
+    while 0 <= index < len(groups):
+        segment = subway_segment(groups[index])
+        if segment:
+            return segment
+        index += step
+    return None
+
+
 def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]:
     props = route_geojson.get("properties") or {}
     features = route_geojson.get("features") or []
@@ -341,33 +592,89 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             station_name = from_name or to_name
             if station_name:
                 if inside_station:
+                    exit_devices = related_voice_guidance_devices(
+                        station_name,
+                        context="출구 엘리베이터 개찰구 대합실",
+                        limit=3,
+                    )
+                    exit_voice_text = voice_guidance_text(exit_devices)
+                    voice_suffix = f" {exit_voice_text}" if exit_voice_text else ""
                     instructions.append(
                         instruction(
                             "subway_exit",
                             f"{station_name}역에서 지상 출구 또는 엘리베이터를 따라 역 밖으로 이동하세요. "
+                            f"{voice_suffix.strip()} "
                             "역 밖으로 나왔다면 화면을 네 번 터치해주세요. "
                             "확인 후 GPS 안내를 다시 시작해 목적지까지 이동합니다.",
                             station_name=station_name,
+                            voice_guidance_devices=exit_devices,
+                            indoor_data_confidence="catalog_text",
                         )
                     )
                     inside_station = False
                 elif has_subway_ride_before_outdoor(groups, group_index):
+                    next_segment = nearest_subway_segment(groups, group_index + 1, 1)
+                    line_code = next_segment["line_code"] if next_segment else None
+                    next_station_name = next_segment["next_station"] if next_segment else None
+                    direction_text = (
+                        f" {next_segment['line_name']} {next_station_name} 방면 승강장으로 이동합니다."
+                        if next_segment
+                        else ""
+                    )
                     instructions.append(
                         instruction(
                             "subway_entry",
                             f"{station_name}역 입구에 도착했습니다. 역 안에서는 GPS 안내를 사용하지 않습니다. "
-                            "엘리베이터와 역사 이동 안내에 따라 이동합니다. "
+                            f"엘리베이터와 역사 이동 안내에 따라 이동합니다.{direction_text} "
                             "역 안으로 들어가면 화면을 네 번 터치해주세요.",
                             station_name=station_name,
+                            line_code=line_code,
                         )
                     )
-                    for step in movement_steps(station_name, "elevator", limit=4):
+                    entry_devices = related_voice_guidance_devices(
+                        station_name,
+                        context=f"출구 개찰구 대합실 {next_station_name or ''}",
+                        line_code=line_code,
+                        limit=3,
+                    )
+                    entry_voice_text = voice_guidance_text(entry_devices)
+                    if entry_voice_text:
                         instructions.append(
                             instruction(
                                 "subway_internal",
-                                f"{station_name}역 안에서 {naturalize_indoor_step(step)}. "
+                                f"{station_name}역 음성유도기 안내: {entry_voice_text} "
+                                "음성유도기 위치를 보조 기준으로 확인하며 이동하세요.",
+                                station_name=station_name,
+                                line_code=line_code,
+                                voice_guidance_devices=entry_devices,
+                                indoor_data_confidence="catalog_text",
+                            )
+                        )
+                    for step in movement_steps(
+                        station_name,
+                        "station",
+                        limit=5,
+                        line_code=line_code,
+                        next_station_name=next_station_name,
+                    ):
+                        step_devices = related_voice_guidance_devices(
+                            station_name,
+                            context=step,
+                            line_code=line_code,
+                            limit=2,
+                            allow_fallback=False,
+                        )
+                        step_voice_text = voice_guidance_text(step_devices)
+                        voice_suffix = f" {step_voice_text}" if step_voice_text else ""
+                        instructions.append(
+                            instruction(
+                                "subway_internal",
+                                f"{station_name}역 안에서 {naturalize_indoor_step(step)}.{voice_suffix} "
                                 "이동을 마치면 화면을 네 번 터치해주세요.",
                                 station_name=station_name,
+                                line_code=line_code,
+                                voice_guidance_devices=step_devices,
+                                indoor_data_confidence="catalog_text",
                             )
                         )
                     inside_station = True
@@ -398,6 +705,7 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             from_name = station_name_from_node(first_props.get("route_from_node"), first_props.get("route_from_node_id"))
             to_name = station_name_from_node(last_props.get("route_to_node"), last_props.get("route_to_node_id"))
             if last_subway_line and line_code != last_subway_line:
+                transfer_next_station_name = station_name_from_node(first_props.get("route_to_node"), first_props.get("route_to_node_id"))
                 instructions.append(
                     instruction(
                         "transfer",
@@ -406,13 +714,33 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
                         station_name=from_name,
                     )
                 )
-                for step in movement_steps(from_name, "station", limit=4):
+                for step in movement_steps(
+                    from_name,
+                    "transfer",
+                    limit=6,
+                    line_code=last_subway_line,
+                    transfer_to_line_code=line_code,
+                    transfer_next_station_name=transfer_next_station_name,
+                ):
+                    step_devices = related_voice_guidance_devices(
+                        from_name,
+                        context=f"환승 {step} {transfer_next_station_name}",
+                        line_code=last_subway_line,
+                        limit=2,
+                        allow_fallback=False,
+                    )
+                    step_voice_text = voice_guidance_text(step_devices)
+                    voice_suffix = f" {step_voice_text}" if step_voice_text else ""
                     instructions.append(
                         instruction(
                             "subway_internal",
-                            f"{from_name}역 안에서 {naturalize_indoor_step(step)}. "
+                            f"{from_name}역 안에서 {naturalize_indoor_step(step)}.{voice_suffix} "
                             "이동을 마치면 화면을 네 번 터치해주세요.",
                             station_name=from_name,
+                            line_code=last_subway_line,
+                            transfer_to_line_code=line_code,
+                            voice_guidance_devices=step_devices,
+                            indoor_data_confidence="catalog_text",
                         )
                     )
             instructions.append(

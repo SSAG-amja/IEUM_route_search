@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import gzip
 import json
+import math
 import os
 import sqlite3
 import urllib.parse
@@ -23,6 +24,18 @@ DB_PATH = ROOT / "routing" / "ieum_graph.sqlite"
 ENV_PATH = ROOT / ".env"
 RESULTS_DIR = ROOT / "routing" / "results"
 TRANSFER_PENALTY = 700.0
+ONE_STATION_WALK_M = 900.0
+LONG_WALK_PENALTY_PER_M = 0.7
+WALK_BUCKET_M = 250.0
+MAX_WALK_BUCKET = 16
+WALK_LIKE_EDGE_TYPES = {
+    "walk",
+    "braille_walk",
+    "crosswalk",
+    "crosswalk_connector",
+    "facility_connector",
+    "subway_connector",
+}
 
 
 @dataclass(frozen=True)
@@ -277,32 +290,43 @@ def nearest_node(
     raise RuntimeError("nearest node not found")
 
 
-def load_adjacency(conn: sqlite3.Connection) -> dict[str, list[tuple[str, float, str, str, str | None]]]:
-    adjacency: dict[str, list[tuple[str, float, str, str, str | None]]] = {}
-    for edge_id, from_id, to_id, weight, edge_type, line_code in conn.execute(
-        "SELECT edge_id, from_node_id, to_node_id, visual_impairment_weight, edge_type, line_code FROM edges"
+def load_adjacency(conn: sqlite3.Connection) -> dict[str, list[tuple[str, float, float, str, str, str | None]]]:
+    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]] = {}
+    for edge_id, from_id, to_id, weight, length_m, edge_type, line_code in conn.execute(
+        "SELECT edge_id, from_node_id, to_node_id, visual_impairment_weight, length_m, edge_type, line_code FROM edges"
     ):
         cost = float(weight)
-        adjacency.setdefault(from_id, []).append((to_id, cost, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
-        adjacency.setdefault(to_id, []).append((from_id, cost, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
+        length = float(length_m or 0)
+        adjacency.setdefault(from_id, []).append((to_id, cost, length, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
+        adjacency.setdefault(to_id, []).append((from_id, cost, length, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
     return adjacency
 
 
+def walk_bucket(walk_m: float) -> int:
+    return min(int(math.ceil(walk_m / WALK_BUCKET_M)), MAX_WALK_BUCKET)
+
+
+def long_walk_penalty(previous_walk_m: float, next_walk_m: float) -> float:
+    previous_over = max(0.0, previous_walk_m - ONE_STATION_WALK_M)
+    next_over = max(0.0, next_walk_m - ONE_STATION_WALK_M)
+    return (next_over - previous_over) * LONG_WALK_PENALTY_PER_M
+
+
 def dijkstra(
-    adjacency: dict[str, list[tuple[str, float, str, str, str | None]]],
+    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]],
     start_id: str,
     goal_id: str,
     max_visited: int = 350000,
 ) -> tuple[float, list[tuple[str, str, str]]]:
-    start_state = (start_id, None)
-    queue: list[tuple[float, str, str | None]] = [(0.0, start_id, None)]
+    start_state = (start_id, None, 0)
+    queue: list[tuple[float, str, str | None, int]] = [(0.0, start_id, None, 0)]
     best = {start_state: 0.0}
-    previous: dict[tuple[str, str | None], tuple[tuple[str, str | None], str]] = {}
-    goal_state: tuple[str, str | None] | None = None
+    previous: dict[tuple[str, str | None, int], tuple[tuple[str, str | None, int], str]] = {}
+    goal_state: tuple[str, str | None, int] | None = None
     visited = 0
     while queue:
-        cost, node_id, current_line = heapq.heappop(queue)
-        state = (node_id, current_line)
+        cost, node_id, current_line, current_walk_bucket = heapq.heappop(queue)
+        state = (node_id, current_line, current_walk_bucket)
         if cost != best.get(state):
             continue
         visited += 1
@@ -311,19 +335,35 @@ def dijkstra(
             break
         if visited > max_visited:
             raise RuntimeError(f"route search exceeded visit limit: {max_visited}")
-        for next_id, edge_cost, edge_id, edge_type, line_code in adjacency.get(node_id, []):
+        current_walk_m = current_walk_bucket * WALK_BUCKET_M
+        for next_id, edge_cost, edge_length_m, edge_id, edge_type, line_code in adjacency.get(node_id, []):
             next_line = line_code if edge_type == "subway_ride" else current_line
+            if edge_type == "subway_ride":
+                next_walk_m = 0.0
+                next_walk_bucket = 0
+            elif edge_type in WALK_LIKE_EDGE_TYPES:
+                edge_walk_bucket = walk_bucket(edge_length_m) if edge_length_m > 0 else 0
+                next_walk_bucket = min(current_walk_bucket + edge_walk_bucket, MAX_WALK_BUCKET)
+                next_walk_m = next_walk_bucket * WALK_BUCKET_M
+            else:
+                next_walk_m = current_walk_m
+                next_walk_bucket = current_walk_bucket
             transfer_cost = (
                 TRANSFER_PENALTY
                 if edge_type == "subway_ride" and current_line and line_code and current_line != line_code
                 else 0.0
             )
-            new_cost = cost + edge_cost + transfer_cost
-            next_state = (next_id, next_line)
+            walk_penalty = (
+                long_walk_penalty(current_walk_m, next_walk_m)
+                if edge_type in WALK_LIKE_EDGE_TYPES
+                else 0.0
+            )
+            new_cost = cost + edge_cost + transfer_cost + walk_penalty
+            next_state = (next_id, next_line, next_walk_bucket)
             if new_cost < best.get(next_state, float("inf")):
                 best[next_state] = new_cost
                 previous[next_state] = (state, edge_id)
-                heapq.heappush(queue, (new_cost, next_id, next_line))
+                heapq.heappush(queue, (new_cost, next_id, next_line, next_walk_bucket))
     if goal_state is None:
         raise RuntimeError("route not found")
 

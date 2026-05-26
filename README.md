@@ -1,6 +1,6 @@
 # IEUM Seoul Accessibility Dataset
 
-서울시 시각장애인 보행 및 지하철 접근성 경로 탐색 MVP 데이터셋과 실행 서버입니다.
+서울시 시각장애인 보행 및 지하철 접근성 경로 탐색 MVP 데이터셋과 FastAPI 실행 서버입니다.
 
 ## 데이터 구성
 
@@ -90,7 +90,11 @@ README.md
 
 ## 실행 준비
 
-Python 3.10 이상을 권장합니다. 현재 서버는 Python 표준 라이브러리만 사용합니다.
+Python 3.10 이상을 권장합니다. 서버 의존성을 설치합니다.
+
+```bash
+python -m pip install -r requirements.txt
+```
 
 Kakao 주소/장소명 검색을 쓰려면 `.env.example`을 참고해 `.env` 파일을 만듭니다.
 
@@ -109,8 +113,11 @@ python routing\route_server.py
 기본 접속 주소:
 
 ```text
-http://localhost:8020/
+http://localhost:8020/demo/
+http://localhost:8020/docs
 ```
+
+서버는 모바일 개발 기기에서 접근할 수 있도록 기본적으로 `0.0.0.0`에 바인딩됩니다. 앱에서는 개발 PC의 LAN IP를 API 주소로 사용합니다.
 
 다른 포트:
 
@@ -123,6 +130,12 @@ Git Bash:
 
 ```bash
 IEUM_ROUTE_PORT=8021 python routing/route_server.py
+```
+
+호스트를 localhost로 제한하려면:
+
+```bash
+IEUM_ROUTE_HOST=127.0.0.1 python routing/route_server.py
 ```
 
 ## 첫 실행 동작
@@ -140,34 +153,48 @@ IEUM_ROUTE_PORT=8021 python routing/route_server.py
 
 ## 주요 API
 
-경로 검색:
+모바일 앱용 경로 생성:
 
-```text
-GET /api/route?start=고덕로%20210&end=잠실%20롯데타워
+```http
+POST /api/v1/routes
+Content-Type: application/json
+
+{
+  "origin": {
+    "coordinate": { "latitude": 37.565715, "longitude": 126.977088 },
+    "label": "현재 위치"
+  },
+  "destination": { "query": "강남역" },
+  "profile": "visual_impairment_default"
+}
 ```
 
-좌표 직접 입력:
+응답은 지도 표시용 `geometry`, 경로 요약 `summary`, 안내 문장 `instructions`, 모바일 안내 단위인 `legs`를 포함합니다.
+
+브라우저 데모 호환 경로 검색:
 
 ```text
-GET /api/route?start=127.14854472216015,37.55269966641881&end=126.9677018192213,37.5519822941232
+GET /api/route?start=126.977088,37.565715&end=127.027621,37.497952
 ```
 
 데이터 layer:
 
 ```text
-GET /api/dataset?name=subway_line
-GET /api/dataset?name=subway_station
-GET /api/dataset?name=subway_elevator
-GET /api/dataset?name=braille
-GET /api/dataset?name=crosswalk
-GET /api/dataset?name=audible
+GET /api/v1/datasets/subway_line
+GET /api/v1/datasets/subway_station
+GET /api/v1/datasets/subway_elevator
+GET /api/v1/datasets/braille
+GET /api/v1/datasets/crosswalk
+GET /api/v1/datasets/audible
 ```
 
 안내 멘트 템플릿:
 
 ```text
-GET /api/instruction-templates
+GET /api/v1/instruction-templates
 ```
+
+기존 `/api/route`, `/api/dataset`, `/api/instruction-templates` endpoint는 분리된 `demo/web` 테스트 페이지의 이전 호출 호환을 위해 유지됩니다.
 
 ## 최종 경로 원칙
 

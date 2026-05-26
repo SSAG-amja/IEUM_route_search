@@ -228,11 +228,24 @@ function addMarkers(summary) {
 }
 
 async function findRoute(start, end) {
-  const url = `/api/route?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetch("/api/v1/routes", {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      origin: { query: start },
+      destination: { query: end },
+      profile: "visual_impairment_default",
+    }),
+  });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "route failed");
-  return payload;
+  if (!response.ok) throw new Error(payload.detail || "route failed");
+  return {
+    type: "FeatureCollection",
+    properties: payload.summary,
+    instructions: payload.instructions,
+    features: payload.geometry.features,
+  };
 }
 
 form.addEventListener("submit", async (event) => {
@@ -262,7 +275,7 @@ form.addEventListener("submit", async (event) => {
 showTemplates.addEventListener("click", async () => {
   setStatus("전체 멘트 목록 로딩 중...");
   try {
-    const response = await fetch("/api/instruction-templates", { cache: "no-store" });
+    const response = await fetch("/api/v1/instruction-templates", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "template load failed");
     const rows = Object.entries(payload.templates || {}).flatMap(([group, texts]) =>

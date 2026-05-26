@@ -36,8 +36,8 @@ INSTRUCTION_TEMPLATES: dict[str, list[str]] = {
         "음향신호기 정보가 없으면 차량 흐름과 보행 신호를 다시 확인하세요.",
     ],
     "subway_entry": [
-        "{station_name}역 접근 구간입니다.",
-        "역 내부에서는 GPS가 불안정할 수 있으므로 엘리베이터와 역사 이동동선 안내를 우선합니다.",
+        "{station_name}역 입구에 도착했습니다.",
+        "역 안에서는 GPS 안내를 사용하지 않습니다. 이동을 마치면 화면을 네 번 터치해주세요.",
     ],
     "subway_ride": [
         "{line_name}을 이용해 {from_station}에서 {to_station}까지 {edge_count}개 구간 이동하세요.",
@@ -48,7 +48,15 @@ INSTRUCTION_TEMPLATES: dict[str, list[str]] = {
         "환승 구간은 역사 내부 이동동선과 엘리베이터 정보를 우선 사용합니다.",
     ],
     "subway_internal": [
-        "{station_name}역 내부 이동: {step}",
+        "{station_name}역 안에서 {step}. 이동을 마치면 화면을 네 번 터치해주세요.",
+    ],
+    "subway_exit": [
+        "{station_name}역 밖으로 이동하세요. 역 밖으로 나왔다면 화면을 네 번 터치해주세요.",
+        "확인 후 GPS 안내를 다시 시작합니다.",
+    ],
+    "station_passage": [
+        "{station_name}역 안에서는 GPS 안내를 사용하지 않습니다.",
+        "역 밖으로 이동한 뒤 화면을 네 번 터치해주세요. 확인 후 GPS 안내를 다시 시작합니다.",
     ],
     "facility_connector": [
         "엘리베이터 또는 접근성 시설 연결 구간을 {distance_m}미터 이동하세요.",
@@ -106,6 +114,27 @@ def station_name_from_node(node: dict[str, Any] | None, node_id: str | None = No
 def compact_step_text(value: Any) -> str:
     text = str(value or "").strip()
     return re.sub(r"^\d+\)\s*", "", text)
+
+
+def naturalize_indoor_step(value: str) -> str:
+    text = value.strip()
+    floor = re.match(r"^\((B?)(\d+)(?:F)?\)\s*", text)
+    if floor:
+        level = f"지하 {floor.group(2)}층" if floor.group(1) else f"{floor.group(2)}층"
+        text = f"{level} {text[floor.end():]}"
+    text = text.replace("엘리베이터 탑승", "엘리베이터에 탑승")
+    for ending, replacement in (
+        ("탑승", "탑승하세요"),
+        ("하차", "내리세요"),
+        ("이용", "이용하세요"),
+        ("이동", "이동하세요"),
+        ("통과", "통과하세요"),
+    ):
+        if text.endswith(ending):
+            return f"{text[:-len(ending)]}{replacement}"
+    if text.endswith("승강장"):
+        return f"{text}으로 이동하세요"
+    return text if text.endswith((".", "요")) else f"{text}로 이동하세요"
 
 
 def movement_steps(station_name: str, prefer: str = "elevator", limit: int = 5) -> list[str]:
@@ -261,6 +290,16 @@ def append_walk_instructions(instructions: list[dict[str, Any]], group: list[dic
         instructions.append(instruction(item_type, text, distance_m=distance, direction=direction))
 
 
+def has_subway_ride_before_outdoor(groups: list[list[dict[str, Any]]], start_index: int) -> bool:
+    for next_group in groups[start_index + 1 :]:
+        edge_type = str((next_group[0].get("properties") or {}).get("edge_type") or "unknown")
+        if edge_type == "subway_ride":
+            return True
+        if edge_type in {"walk", "crosswalk"}:
+            return False
+    return False
+
+
 def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]:
     props = route_geojson.get("properties") or {}
     features = route_geojson.get("features") or []
@@ -270,7 +309,9 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
     ]
 
     last_subway_line: str | None = None
-    for group in group_consecutive(features):
+    inside_station = False
+    groups = group_consecutive(features)
+    for group_index, group in enumerate(groups):
         first_props = group[0].get("properties") or {}
         last_props = group[-1].get("properties") or {}
         edge_type = first_props.get("edge_type")
@@ -299,15 +340,48 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             to_name = station_name_from_node(last_props.get("route_to_node"), last_props.get("route_to_node_id"))
             station_name = from_name or to_name
             if station_name:
-                instructions.append(
-                    instruction(
-                        "subway_entry",
-                        f"{station_name}역 접근 구간입니다. 역 내부에서는 엘리베이터와 역사 이동동선 안내를 우선합니다.",
-                        station_name=station_name,
+                if inside_station:
+                    instructions.append(
+                        instruction(
+                            "subway_exit",
+                            f"{station_name}역에서 지상 출구 또는 엘리베이터를 따라 역 밖으로 이동하세요. "
+                            "역 밖으로 나왔다면 화면을 네 번 터치해주세요. "
+                            "확인 후 GPS 안내를 다시 시작해 목적지까지 이동합니다.",
+                            station_name=station_name,
+                        )
                     )
-                )
-                for step in movement_steps(station_name, "elevator", limit=4):
-                    instructions.append(instruction("subway_internal", f"{station_name}역 내부 이동: {step}", station_name=station_name))
+                    inside_station = False
+                elif has_subway_ride_before_outdoor(groups, group_index):
+                    instructions.append(
+                        instruction(
+                            "subway_entry",
+                            f"{station_name}역 입구에 도착했습니다. 역 안에서는 GPS 안내를 사용하지 않습니다. "
+                            "엘리베이터와 역사 이동 안내에 따라 이동합니다. "
+                            "역 안으로 들어가면 화면을 네 번 터치해주세요.",
+                            station_name=station_name,
+                        )
+                    )
+                    for step in movement_steps(station_name, "elevator", limit=4):
+                        instructions.append(
+                            instruction(
+                                "subway_internal",
+                                f"{station_name}역 안에서 {naturalize_indoor_step(step)}. "
+                                "이동을 마치면 화면을 네 번 터치해주세요.",
+                                station_name=station_name,
+                            )
+                        )
+                    inside_station = True
+                else:
+                    instructions.append(
+                        instruction(
+                            "station_passage",
+                            f"{station_name}역 안을 통과하는 접근성 이동 구간입니다. "
+                            "역 안에서는 GPS 안내를 사용하지 않습니다. "
+                            "엘리베이터 또는 안내 동선을 따라 역 밖으로 이동한 뒤 화면을 네 번 터치해주세요. "
+                            "확인 후 GPS 안내를 다시 시작합니다.",
+                            station_name=station_name,
+                        )
+                    )
             else:
                 instructions.append(instruction("subway_connector", f"지하철역 연결 구간을 약 {dist}미터 이동하세요.", distance_m=dist))
             continue
@@ -324,13 +398,28 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             from_name = station_name_from_node(first_props.get("route_from_node"), first_props.get("route_from_node_id"))
             to_name = station_name_from_node(last_props.get("route_to_node"), last_props.get("route_to_node_id"))
             if last_subway_line and line_code != last_subway_line:
-                instructions.append(instruction("transfer", f"{from_name}역에서 {last_subway_line}호선에서 {line_name}으로 환승합니다.", station_name=from_name))
+                instructions.append(
+                    instruction(
+                        "transfer",
+                        f"{from_name}역에서 {last_subway_line}호선에서 {line_name}으로 환승합니다. "
+                        "환승 이동 안내를 시작하려면 화면을 네 번 터치해주세요.",
+                        station_name=from_name,
+                    )
+                )
                 for step in movement_steps(from_name, "station", limit=4):
-                    instructions.append(instruction("subway_internal", f"{from_name}역 환승 이동: {step}", station_name=from_name))
+                    instructions.append(
+                        instruction(
+                            "subway_internal",
+                            f"{from_name}역 안에서 {naturalize_indoor_step(step)}. "
+                            "이동을 마치면 화면을 네 번 터치해주세요.",
+                            station_name=from_name,
+                        )
+                    )
             instructions.append(
                 instruction(
                     "subway_ride",
-                    f"{line_name}을 이용해 {from_name}역에서 {to_name}역까지 {len(group)}개 구간 이동하세요.",
+                    f"{line_name}을 이용해 {from_name}역에서 {to_name}역까지 {len(group)}개 구간 이동하세요. "
+                    f"{to_name}역에 도착하면 화면을 네 번 터치해주세요.",
                     line_code=line_code,
                     from_station=from_name,
                     to_station=to_name,
@@ -339,6 +428,7 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
                 )
             )
             last_subway_line = line_code
+            inside_station = True
             continue
 
         if edge_type == "crosswalk_connector":

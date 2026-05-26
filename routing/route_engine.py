@@ -316,7 +316,7 @@ def dijkstra(
     adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]],
     start_id: str,
     goal_id: str,
-    max_visited: int = 350000,
+    max_visited: int = 2000000,
 ) -> tuple[float, list[tuple[str, str, str]]]:
     start_state = (start_id, None, 0)
     queue: list[tuple[float, str, str | None, int]] = [(0.0, start_id, None, 0)]

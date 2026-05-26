@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+import gzip
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from threading import RLock
+from typing import Any
+from uuid import uuid4
+
+from .schemas import LocationInput, RouteCreateRequest, RouteLeg, RouteResponse, RouteStep
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ROUTING_PATH = ROOT / "routing"
+WORKSPACE_ROOT = ROOT.parent
+NAV_DATA = WORKSPACE_ROOT / "nav_map" / "web" / "data"
+SUBWAY_DATA = WORKSPACE_ROOT / "subway_station_catalog" / "web" / "data"
+LOCAL_LAYER_GZ = ROOT / "data_gz" / "layers"
+sys.path.append(str(ROUTING_PATH))
+
+import route_engine  # noqa: E402
+import route_instructions  # noqa: E402
+
+
+DATASET_FILES = {
+    "braille": (NAV_DATA / "braille_network_links.geojson", LOCAL_LAYER_GZ / "braille_network_links.geojson.gz"),
+    "crosswalk": (NAV_DATA / "crosswalk_links_enriched.geojson", LOCAL_LAYER_GZ / "crosswalk_links_enriched.geojson.gz"),
+    "audible": (NAV_DATA / "audible_signal_points.geojson", LOCAL_LAYER_GZ / "audible_signal_points.geojson.gz"),
+    "subway_elevator": (NAV_DATA / "subway_elevators.geojson", LOCAL_LAYER_GZ / "subway_elevators.geojson.gz"),
+    "subway_station": (SUBWAY_DATA / "merged_station_points.geojson", LOCAL_LAYER_GZ / "merged_station_points.geojson.gz"),
+    "subway_line": (SUBWAY_DATA / "line_segments_display.geojson", LOCAL_LAYER_GZ / "line_segments_display.geojson.gz"),
+}
+
+
+def ensure_runtime_db() -> None:
+    if route_engine.DB_PATH.exists():
+        return
+    subprocess.run([sys.executable, str(ROUTING_PATH / "build_sqlite_graph.py")], cwd=str(ROOT), check=True)
+    subprocess.run([sys.executable, str(ROUTING_PATH / "enrich_sqlite_accessibility.py")], cwd=str(ROOT), check=True)
+
+
+def _leg_type(edge_type: str, passed_subway: bool, has_subway_ahead: bool) -> str:
+    if edge_type == "subway_ride":
+        return "subway_ride"
+    if edge_type == "subway_connector":
+        return "station_exit" if passed_subway and not has_subway_ahead else "station_entry"
+    return "outdoor_walk"
+
+
+def _accessibility_tags(features: list[dict[str, Any]]) -> list[str]:
+    tags: set[str] = set()
+    for feature in features:
+        props = feature.get("properties") or {}
+        if props.get("has_braille") or int(props.get("near_braille_count") or 0):
+            tags.add("braille")
+        if props.get("has_audible_signal") or int(props.get("near_audible_signal_count") or 0):
+            tags.add("audible_signal")
+        if props.get("has_elevator"):
+            tags.add("elevator")
+        if props.get("edge_type") == "crosswalk":
+            tags.add("crosswalk")
+    return sorted(tags)
+
+
+def build_legs(features: list[dict[str, Any]]) -> list[RouteLeg]:
+    legs: list[RouteLeg] = []
+    passed_subway = False
+    for index, feature in enumerate(features):
+        edge_type = str((feature.get("properties") or {}).get("edge_type") or "unknown")
+        has_subway_ahead = any(
+            (remaining.get("properties") or {}).get("edge_type") == "subway_ride"
+            for remaining in features[index + 1 :]
+        )
+        current_type = _leg_type(edge_type, passed_subway, has_subway_ahead)
+        if edge_type == "subway_ride":
+            passed_subway = True
+        if legs and legs[-1].type == current_type:
+            existing = legs[-1]
+            appended = existing.geometry["features"] + [feature]
+            legs[-1] = RouteLeg(
+                type=existing.type,
+                distance_m=round(existing.distance_m + float((feature.get("properties") or {}).get("length_m") or 0), 1),
+                edge_count=existing.edge_count + 1,
+                geometry={"type": "FeatureCollection", "features": appended},
+                accessibility=_accessibility_tags(appended),
+            )
+            continue
+        legs.append(
+            RouteLeg(
+                type=current_type,
+                distance_m=round(float((feature.get("properties") or {}).get("length_m") or 0), 1),
+                edge_count=1,
+                geometry={"type": "FeatureCollection", "features": [feature]},
+                accessibility=_accessibility_tags([feature]),
+            )
+        )
+    return legs
+
+
+class RoutingService:
+    def __init__(self) -> None:
+        self.conn: sqlite3.Connection | None = None
+        self.adjacency: dict[str, list[Any]] | None = None
+        self.lock = RLock()
+
+    def open(self) -> None:
+        ensure_runtime_db()
+        self.conn = sqlite3.connect(route_engine.DB_PATH, check_same_thread=False)
+        self.adjacency = route_engine.load_adjacency(self.conn)
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+        self.conn = None
+        self.adjacency = None
+
+    def create_route(self, request: RouteCreateRequest) -> RouteResponse:
+        if request.profile != "visual_impairment_default":
+            raise ValueError(f"unsupported profile: {request.profile}")
+        if self.conn is None or self.adjacency is None:
+            raise RuntimeError("routing service is not ready")
+        with self.lock:
+            route = route_engine.build_route_geojson(
+                self.conn,
+                request.origin.engine_query(),
+                request.destination.engine_query(),
+                self.adjacency,
+            )
+        steps = [RouteStep.model_validate(item) for item in route.get("instructions") or []]
+        features = route.get("features") or []
+        return RouteResponse(
+            route_id=f"route_{uuid4().hex}",
+            profile=request.profile,
+            summary=route.get("properties") or {},
+            geometry={"type": "FeatureCollection", "features": features},
+            instructions=steps,
+            legs=build_legs(features),
+        )
+
+    def create_legacy_route(self, start: str, end: str) -> dict[str, Any]:
+        request = RouteCreateRequest(
+            origin=LocationInput(query=start),
+            destination=LocationInput(query=end),
+        )
+        response = self.create_route(request)
+        return {
+            "type": "FeatureCollection",
+            "properties": response.summary,
+            "instructions": [step.model_dump(exclude_none=True) for step in response.instructions],
+            "features": response.geometry["features"],
+        }
+
+
+def load_dataset(name: str) -> dict[str, Any]:
+    candidates = DATASET_FILES.get(name)
+    if candidates is None:
+        raise KeyError(name)
+    for path in candidates:
+        if not path.exists():
+            continue
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                return json.load(handle)
+        return json.loads(path.read_text(encoding="utf-8"))
+    raise FileNotFoundError(name)

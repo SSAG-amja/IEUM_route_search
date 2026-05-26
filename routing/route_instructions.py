@@ -319,7 +319,7 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
         if dist < 1 and edge_type not in {"subway_ride"}:
             continue
 
-        if edge_type == "walk":
+        if edge_type in {"walk", "route_start_connector", "route_end_connector"}:
             append_walk_instructions(instructions, group)
             continue
 

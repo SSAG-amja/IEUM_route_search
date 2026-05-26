@@ -4,6 +4,7 @@ import re
 import time
 import os
 import subprocess
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 import edge_tts
 from pywhispercpp.model import Model
@@ -16,7 +17,6 @@ import json
 import sqlite3
 import subprocess
 import sys
-from pathlib import Path
 from threading import RLock
 from typing import Any
 from uuid import uuid4
@@ -175,6 +175,7 @@ gemini_config = types.GenerateContentConfig(
         "조사(로, 으로, 까지 등), 서술어(가줘, 안내해 등), 수식어는 절대 포함하지 마. "
         "오직 장소 이름만 단답형으로 출력해. (예: '서울역으로 가줘' -> '서울역') "
         "목적지가 명확하지 않거나 없으면 'None'이라고 출력해."
+        "실제로 존재하는 장소를 반환해야해 장소가 정확하지 않더라도 실제로 네이버나 카카오 지도에서 검색 가능한 이름을 반환해."
     ),
     temperature=0.0,
     max_output_tokens=20,
@@ -192,17 +193,30 @@ class VoiceService:
             print_progress=False,
         )
 
-    def transcribe(self, audio_data: bytes) -> str:
-        # (기존 코드와 동일하므로 생략하지 않고 그대로 두시면 됩니다.)
+    def transcribe(
+        self,
+        audio_data: bytes,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
         if not self.whisper_model:
             raise RuntimeError("voice service is not ready")
-        with NamedTemporaryFile(suffix=".webm") as temp:
+        suffix = ".webm"
+        if filename:
+            suffix = Path(filename).suffix or suffix
+        elif content_type == "audio/wav":
+            suffix = ".wav"
+
+        with NamedTemporaryFile(suffix=suffix) as temp:
             temp.write(audio_data)
             temp.flush()
             try:
                 segments = self.whisper_model.transcribe(temp.name, language="ko")
                 return " ".join(segment.text.strip() for segment in segments).strip()
-            except subprocess.CalledProcessError as exc:
+            except Exception as exc:
+                message = str(exc)
+                if "FFMPEG is not installed or not in PATH" in message:
+                    raise ValueError("audio decode failed: ffmpeg is required for this audio format") from exc
                 raise ValueError("audio decode failed") from exc
 
     # 3. 비동기 호출 방식 변경 (gemini_model.generate_content_async -> client.aio.models.generate_content)

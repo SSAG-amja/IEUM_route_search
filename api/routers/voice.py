@@ -3,7 +3,6 @@ import base64
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from starlette.responses import Response
-from aiohttp.client_exceptions import ClientError
 
 from ..schemas import TextBody, VoiceAnalysisResponse
 from ..services import VoiceService
@@ -29,7 +28,11 @@ async def destination(request: Request, file: UploadFile = File(...)):
     
     try:
         # 1. STT: 오디오 -> 텍스트
-        text = service.transcribe(data)
+        text = service.transcribe(
+            data,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
         
         # 음성 인식이 안 된 경우의 처리
         if not text:
@@ -71,5 +74,5 @@ async def tts(body: TextBody, request: Request):
     try:
         audio = await service_from(request).make_tts(body.text.strip())
         return Response(content=audio, media_type="audio/mpeg")
-    except ClientError as exc:
+    except Exception as exc:
         raise HTTPException(status_code=502, detail="edge tts failed") from exc

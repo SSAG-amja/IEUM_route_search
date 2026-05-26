@@ -9,8 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from .routers import routes, support
-from .services import RoutingService
+from .routers import routes, support, voice
+from .services import RoutingService, VoiceService
+
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,10 @@ async def lifespan(app: FastAPI):
     routing_service = RoutingService()
     routing_service.open()
     app.state.routing_service = routing_service
+
+    voic_service = VoiceService()
+    voic_service.open()
+    app.state.voice_service = voic_service
     yield
     routing_service.close()
 
@@ -46,6 +51,7 @@ app.add_middleware(
 
 app.include_router(routes.router)
 app.include_router(support.router)
+app.include_router(voice.router)
 
 if DEMO_WEB.exists():
     app.mount("/demo", StaticFiles(directory=str(DEMO_WEB), html=True), name="demo")

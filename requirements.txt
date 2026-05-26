@@ -6,5 +6,5 @@ fastapi==0.115.0
 pywhispercpp==1.4.1
 python-multipart==0.0.9
 uvicorn==0.30.6
-google-generativeai
+google-genai
 python-dotenv

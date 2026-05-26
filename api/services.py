@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+import re
+import time
+import os
+import subprocess
+from tempfile import NamedTemporaryFile
+import edge_tts
+from pywhispercpp.model import Model
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+
 import gzip
 import json
 import sqlite3
@@ -12,6 +23,7 @@ from uuid import uuid4
 
 from .schemas import LocationInput, RouteCreateRequest, RouteLeg, RouteResponse, RouteStep
 
+load_dotenv()
 
 ROOT = Path(__file__).resolve().parents[1]
 ROUTING_PATH = ROOT / "routing"
@@ -152,7 +164,76 @@ class RoutingService:
             "instructions": [step.model_dump(exclude_none=True) for step in response.instructions],
             "features": response.geometry["features"],
         }
+    
+# 1. 새 방식의 클라이언트 초기화
+gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
+# 2. 시스템 프롬프트 및 설정 객체 생성
+gemini_config = types.GenerateContentConfig(
+    system_instruction=(
+        "사용자의 텍스트에서 가고자 하는 '최종 목적지'의 명칭만 정확하게 추출해. "
+        "조사(로, 으로, 까지 등), 서술어(가줘, 안내해 등), 수식어는 절대 포함하지 마. "
+        "오직 장소 이름만 단답형으로 출력해. (예: '서울역으로 가줘' -> '서울역') "
+        "목적지가 명확하지 않거나 없으면 'None'이라고 출력해."
+    ),
+    temperature=0.0,
+    max_output_tokens=20,
+)
+
+class VoiceService:
+    def __init__(self) -> None:
+        self.whisper_model: Model | None = None
+
+    def open(self) -> None:
+        self.whisper_model = Model(
+            "small",
+            n_threads=max(1, os.cpu_count() or 1),
+            print_realtime=False,
+            print_progress=False,
+        )
+
+    def transcribe(self, audio_data: bytes) -> str:
+        # (기존 코드와 동일하므로 생략하지 않고 그대로 두시면 됩니다.)
+        if not self.whisper_model:
+            raise RuntimeError("voice service is not ready")
+        with NamedTemporaryFile(suffix=".webm") as temp:
+            temp.write(audio_data)
+            temp.flush()
+            try:
+                segments = self.whisper_model.transcribe(temp.name, language="ko")
+                return " ".join(segment.text.strip() for segment in segments).strip()
+            except subprocess.CalledProcessError as exc:
+                raise ValueError("audio decode failed") from exc
+
+    # 3. 비동기 호출 방식 변경 (gemini_model.generate_content_async -> client.aio.models.generate_content)
+    async def extract_destination(self, text: str) -> str:
+        if not text.strip():
+            return ""
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=text,
+                config=gemini_config
+            )
+            extracted = response.text.strip()
+            return "" if extracted.lower() == "none" or not extracted else extracted
+        except Exception as exc:
+            print(f"Gemini API Error: {exc}")
+            return ""
+
+    def build_prompt(self, destination: str) -> str:
+        if not destination:
+            return "목적지를 인식하지 못했습니다. 다시 말씀해주세요."
+        return f"목적지는 {destination} 입니다. 맞으면 화면을 두번, 틀리면 세번 터치해주세요."
+
+    async def make_tts(self, text: str) -> bytes:
+        # (기존 코드와 동일)
+        audio = bytearray()
+        communicate = edge_tts.Communicate(text, "ko-KR-SunHiNeural")
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio.extend(chunk["data"])
+        return bytes(audio)
 
 def load_dataset(name: str) -> dict[str, Any]:
     candidates = DATASET_FILES.get(name)

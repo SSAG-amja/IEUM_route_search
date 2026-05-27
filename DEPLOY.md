@@ -29,6 +29,11 @@ KAKAO_REST_API_KEY=your_kakao_rest_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
+Whisper 품질/속도 튜닝은 `docker-compose.yml`의 환경변수로 조절합니다.
+
+- `IEUM_WHISPER_MODEL=base`: 기본 추천. `tiny`보다 정확도가 좋아지고 `small`보다 가볍습니다.
+- `IEUM_WHISPER_THREADS=2`: 현재 2 vCPU 서버 기준 권장값입니다.
+
 ## Docker 구성
 
 이 폴더에는 아래 파일이 이미 준비되어 있습니다.
@@ -45,6 +50,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 - Nginx만 80 포트에서 받아 내부 `127.0.0.1:8020`으로 전달
 - `restart: always` 포함
 - SQLite DB는 `./storage/ieum_graph.sqlite`에 영속 저장
+- Whisper 기본 모델은 `base`
 
 ## Nginx 구성
 

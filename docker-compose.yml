@@ -11,6 +11,8 @@ services:
       IEUM_ROUTE_HOST: 0.0.0.0
       IEUM_ROUTE_PORT: 8000
       IEUM_ROUTE_DB_PATH: /app/storage/ieum_graph.sqlite
+      IEUM_WHISPER_MODEL: base
+      IEUM_WHISPER_THREADS: 2
       IEUM_CORS_ORIGINS: http://52.78.2.168,http://localhost:8081,http://127.0.0.1:8081,http://localhost:19006,http://127.0.0.1:19006
     ports:
       - "127.0.0.1:8020:8000"

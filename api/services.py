@@ -188,6 +188,8 @@ class VoiceService:
     def __init__(self) -> None:
         self.whisper_model: Model | None = None
         self._model_lock = Lock()
+        self.model_name = os.environ.get("IEUM_WHISPER_MODEL", "base").strip() or "base"
+        self.model_threads = int(os.environ.get("IEUM_WHISPER_THREADS", str(max(1, os.cpu_count() or 1))))
 
     def open(self) -> None:
         self._ensure_model()
@@ -204,13 +206,18 @@ class VoiceService:
             if model is None:
                 started_at = time.perf_counter()
                 model = Model(
-                    "tiny",
-                    n_threads=max(1, os.cpu_count() or 1),
+                    self.model_name,
+                    n_threads=self.model_threads,
                     print_realtime=False,
                     print_progress=False,
                 )
                 self.whisper_model = model
-                logger.info("voice.whisper_loaded model=tiny load_ms=%.1f", (time.perf_counter() - started_at) * 1000)
+                logger.info(
+                    "voice.whisper_loaded model=%s threads=%d load_ms=%.1f",
+                    self.model_name,
+                    self.model_threads,
+                    (time.perf_counter() - started_at) * 1000,
+                )
         return model
 
     def is_ready(self) -> bool:

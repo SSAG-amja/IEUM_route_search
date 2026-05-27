@@ -17,7 +17,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 from uuid import uuid4
 
@@ -184,14 +184,32 @@ gemini_config = types.GenerateContentConfig(
 class VoiceService:
     def __init__(self) -> None:
         self.whisper_model: Model | None = None
+        self._model_lock = Lock()
 
     def open(self) -> None:
-        self.whisper_model = Model(
-            "small",
-            n_threads=max(1, os.cpu_count() or 1),
-            print_realtime=False,
-            print_progress=False,
-        )
+        self._ensure_model()
+
+    def close(self) -> None:
+        self.whisper_model = None
+
+    def _ensure_model(self) -> Model:
+        model = self.whisper_model
+        if model is not None:
+            return model
+        with self._model_lock:
+            model = self.whisper_model
+            if model is None:
+                model = Model(
+                    "tiny",
+                    n_threads=max(1, os.cpu_count() or 1),
+                    print_realtime=False,
+                    print_progress=False,
+                )
+                self.whisper_model = model
+        return model
+
+    def is_ready(self) -> bool:
+        return self.whisper_model is not None
 
     def transcribe(
         self,
@@ -199,8 +217,7 @@ class VoiceService:
         filename: str | None = None,
         content_type: str | None = None,
     ) -> str:
-        if not self.whisper_model:
-            raise RuntimeError("voice service is not ready")
+        model = self._ensure_model()
         suffix = ".webm"
         if filename:
             suffix = Path(filename).suffix or suffix
@@ -211,7 +228,7 @@ class VoiceService:
             temp.write(audio_data)
             temp.flush()
             try:
-                segments = self.whisper_model.transcribe(temp.name, language="ko")
+                segments = model.transcribe(temp.name, language="ko")
                 return " ".join(segment.text.strip() for segment in segments).strip()
             except Exception as exc:
                 message = str(exc)

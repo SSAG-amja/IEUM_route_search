@@ -24,11 +24,11 @@ async def lifespan(app: FastAPI):
     routing_service.open()
     app.state.routing_service = routing_service
 
-    voic_service = VoiceService()
-    voic_service.open()
-    app.state.voice_service = voic_service
+    voice_service = VoiceService()
+    app.state.voice_service = voice_service
     yield
     routing_service.close()
+    voice_service.close()
 
 
 app = FastAPI(

@@ -1,24 +1,18 @@
 from __future__ import annotations
 
 import re
-import time
 import os
 import subprocess
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-import edge_tts
-from pywhispercpp.model import Model
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
 import gzip
 import json
-import logging
 import sqlite3
-import subprocess
 import sys
-from threading import Lock, RLock
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -36,8 +30,6 @@ sys.path.append(str(ROUTING_PATH))
 
 import route_engine  # noqa: E402
 import route_instructions  # noqa: E402
-
-logger = logging.getLogger("ieum.api")
 
 
 DATASET_FILES = {
@@ -176,7 +168,7 @@ gemini_config = types.GenerateContentConfig(
     system_instruction=(
         "사용자의 텍스트에서 가고자 하는 '최종 목적지'의 명칭만 정확하게 추출해. "
         "조사(로, 으로, 까지 등), 서술어(가줘, 안내해 등), 수식어는 절대 포함하지 마. "
-        "오직 장소 이름만 단답형으로 출력해. (예: '서울역으로 가줘' -> '서울역') "
+        "필수 : 오직 장소 이름만 단답형으로 출력해. (예: '서울역으로 가줘' -> '서울역') "
         "목적지가 명확하지 않거나 없으면 'None'이라고 출력해."
         "실제로 존재하는 장소를 반환해야해 장소가 정확하지 않더라도 실제로 네이버나 카카오 지도에서 검색 가능한 이름을 반환해."
     ),
@@ -186,69 +178,14 @@ gemini_config = types.GenerateContentConfig(
 
 class VoiceService:
     def __init__(self) -> None:
-        self.whisper_model: Model | None = None
-        self._model_lock = Lock()
-        self.model_name = os.environ.get("IEUM_WHISPER_MODEL", "base").strip() or "base"
-        self.model_threads = int(os.environ.get("IEUM_WHISPER_THREADS", str(max(1, os.cpu_count() or 1))))
+        pass
 
     def open(self) -> None:
-        self._ensure_model()
+        return None
 
     def close(self) -> None:
-        self.whisper_model = None
+        return None
 
-    def _ensure_model(self) -> Model:
-        model = self.whisper_model
-        if model is not None:
-            return model
-        with self._model_lock:
-            model = self.whisper_model
-            if model is None:
-                started_at = time.perf_counter()
-                model = Model(
-                    self.model_name,
-                    n_threads=self.model_threads,
-                    print_realtime=False,
-                    print_progress=False,
-                )
-                self.whisper_model = model
-                logger.info(
-                    "voice.whisper_loaded model=%s threads=%d load_ms=%.1f",
-                    self.model_name,
-                    self.model_threads,
-                    (time.perf_counter() - started_at) * 1000,
-                )
-        return model
-
-    def is_ready(self) -> bool:
-        return self.whisper_model is not None
-
-    def transcribe(
-        self,
-        audio_data: bytes,
-        filename: str | None = None,
-        content_type: str | None = None,
-    ) -> str:
-        model = self._ensure_model()
-        suffix = ".webm"
-        if filename:
-            suffix = Path(filename).suffix or suffix
-        elif content_type == "audio/wav":
-            suffix = ".wav"
-
-        with NamedTemporaryFile(suffix=suffix) as temp:
-            temp.write(audio_data)
-            temp.flush()
-            try:
-                segments = model.transcribe(temp.name, language="ko")
-                return " ".join(segment.text.strip() for segment in segments).strip()
-            except Exception as exc:
-                message = str(exc)
-                if "FFMPEG is not installed or not in PATH" in message:
-                    raise ValueError("audio decode failed: ffmpeg is required for this audio format") from exc
-                raise ValueError("audio decode failed") from exc
-
-    # 3. 비동기 호출 방식 변경 (gemini_model.generate_content_async -> client.aio.models.generate_content)
     async def extract_destination(self, text: str) -> str:
         if not text.strip():
             return ""
@@ -263,20 +200,6 @@ class VoiceService:
         except Exception as exc:
             print(f"Gemini API Error: {exc}")
             return ""
-
-    def build_prompt(self, destination: str) -> str:
-        if not destination:
-            return "목적지를 인식하지 못했습니다. 다시 말씀해주세요."
-        return f"목적지는 {destination} 입니다. 맞으면 화면을 두번, 틀리면 세번 터치해주세요."
-
-    async def make_tts(self, text: str) -> bytes:
-        # (기존 코드와 동일)
-        audio = bytearray()
-        communicate = edge_tts.Communicate(text, "ko-KR-SunHiNeural")
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio.extend(chunk["data"])
-        return bytes(audio)
 
 def load_dataset(name: str) -> dict[str, Any]:
     candidates = DATASET_FILES.get(name)

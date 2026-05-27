@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import gzip
 import sqlite3
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 DATA_GZ = ROOT / "data_gz"
 ROUTING = ROOT / "routing"
-DB_PATH = ROUTING / "ieum_graph.sqlite"
+DB_PATH = Path(os.environ.get("IEUM_ROUTE_DB_PATH", str(ROUTING / "ieum_graph.sqlite"))).expanduser()
 
 
 def read_geojson(path: Path) -> list[dict[str, Any]]:

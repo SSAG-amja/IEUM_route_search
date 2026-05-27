@@ -65,6 +65,5 @@ class TextBody(BaseModel):
     text: str
 
 class VoiceAnalysisResponse(BaseModel):
-    text: str         # STT로 변환된 원본 텍스트 (화면 표시용)
-    destination: str  # Gemini가 추출한 최종 목적지
-    prompt: str       # TTS나 화면에 띄울 안내 멘트
+    text: str
+    destination: str

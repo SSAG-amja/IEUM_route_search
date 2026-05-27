@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+node_modules/
+storage/
+routing/ieum_graph.sqlite
+routing/results/

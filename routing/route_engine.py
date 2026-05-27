@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parent
 NAV_DATA = WORKSPACE_ROOT / "nav_map" / "web" / "data"
 LOCAL_LAYER_GZ = ROOT / "data_gz" / "layers"
-DB_PATH = ROOT / "routing" / "ieum_graph.sqlite"
+DB_PATH = Path(os.environ.get("IEUM_ROUTE_DB_PATH", str(ROOT / "routing" / "ieum_graph.sqlite"))).expanduser()
 ENV_PATH = ROOT / ".env"
 RESULTS_DIR = ROOT / "routing" / "results"
 TRANSFER_PENALTY = 700.0
@@ -48,6 +48,10 @@ ROUTABLE_SNAP_EDGE_TYPES = {
     "facility_connector",
     "subway_connector",
 }
+
+Edge = tuple[str, float, float, str, str, str | None]
+AdjacencyMap = dict[str, list[Edge]]
+VirtualAdjacencyMap = dict[str, tuple[Edge, ...]]
 
 
 @dataclass(frozen=True)
@@ -348,8 +352,8 @@ def nearby_subway_stations(
     return sorted(stations, key=lambda station: station["distance_m"])[:limit]
 
 
-def load_adjacency(conn: sqlite3.Connection) -> dict[str, list[tuple[str, float, float, str, str, str | None]]]:
-    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]] = {}
+def load_adjacency(conn: sqlite3.Connection) -> AdjacencyMap:
+    adjacency: AdjacencyMap = {}
     for edge_id, from_id, to_id, weight, length_m, edge_type, line_code in conn.execute(
         "SELECT edge_id, from_node_id, to_node_id, visual_impairment_weight, length_m, edge_type, line_code FROM edges"
     ):
@@ -358,6 +362,18 @@ def load_adjacency(conn: sqlite3.Connection) -> dict[str, list[tuple[str, float,
         adjacency.setdefault(from_id, []).append((to_id, cost, length, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
         adjacency.setdefault(to_id, []).append((from_id, cost, length, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
     return adjacency
+
+
+def iter_neighbors(
+    adjacency: AdjacencyMap,
+    node_id: str,
+    virtual_adjacency: VirtualAdjacencyMap | None = None,
+):
+    for edge in adjacency.get(node_id, []):
+        yield edge
+    if virtual_adjacency:
+        for edge in virtual_adjacency.get(node_id, ()):
+            yield edge
 
 
 def line_length_m(coords: list[list[float]]) -> float:
@@ -525,7 +541,7 @@ def virtual_edge_feature(
 
 
 def add_virtual_snap_node(
-    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]],
+    virtual_adjacency: dict[str, list[Edge]],
     virtual_edges: dict[str, dict[str, Any]],
     conn: sqlite3.Connection,
     location: Location,
@@ -549,8 +565,8 @@ def add_virtual_snap_node(
         edge_type = str(props["edge_type"])
         line_code = str(props["line_code"]) if props.get("line_code") else None
         virtual_edges[edge_id] = feature
-        adjacency.setdefault(from_id, []).append((to_id, cost, length, edge_id, edge_type, line_code))
-        adjacency.setdefault(to_id, []).append((from_id, cost, length, edge_id, edge_type, line_code))
+        virtual_adjacency.setdefault(from_id, []).append((to_id, cost, length, edge_id, edge_type, line_code))
+        virtual_adjacency.setdefault(to_id, []).append((from_id, cost, length, edge_id, edge_type, line_code))
     return {
         "node_id": node_id,
         "node_type": "virtual_edge_projection",
@@ -577,13 +593,14 @@ def station_access_penalty(distance_m: float) -> float:
 
 
 def dijkstra(
-    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]],
+    adjacency: AdjacencyMap,
     start_id: str,
     goal_id: str,
     max_visited: int = 2000000,
     allowed_edge_types: set[str] | None = None,
     apply_long_walk_penalty: bool = True,
     apply_transfer_penalty: bool = True,
+    virtual_adjacency: VirtualAdjacencyMap | None = None,
 ) -> tuple[float, list[tuple[str, str, str]]]:
     start_state = (start_id, None, 0)
     queue: list[tuple[float, str, str | None, int]] = [(0.0, start_id, None, 0)]
@@ -603,7 +620,11 @@ def dijkstra(
         if visited > max_visited:
             raise RuntimeError(f"route search exceeded visit limit: {max_visited}")
         current_walk_m = current_walk_bucket * WALK_BUCKET_M
-        for next_id, edge_cost, edge_length_m, edge_id, edge_type, line_code in adjacency.get(node_id, []):
+        for next_id, edge_cost, edge_length_m, edge_id, edge_type, line_code in iter_neighbors(
+            adjacency,
+            node_id,
+            virtual_adjacency,
+        ):
             if allowed_edge_types is not None and edge_type not in allowed_edge_types:
                 continue
             next_line = line_code if edge_type == "subway_ride" else current_line
@@ -882,11 +903,12 @@ def resolve_location_any(conn: sqlite3.Connection, query: str) -> Location:
 
 def candidate_subway_route(
     conn: sqlite3.Connection,
-    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]],
+    adjacency: AdjacencyMap,
     start: Location,
     end: Location,
     start_node: dict[str, Any],
     end_node: dict[str, Any],
+    virtual_adjacency: VirtualAdjacencyMap | None = None,
 ) -> tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None:
     start_stations = nearby_subway_stations(conn, start.lon, start.lat)
     end_stations = nearby_subway_stations(conn, end.lon, end.lat)
@@ -911,6 +933,7 @@ def candidate_subway_route(
                 allowed_edge_types=walk_edge_types,
                 apply_long_walk_penalty=False,
                 apply_transfer_penalty=False,
+                virtual_adjacency=virtual_adjacency,
             )
         except RuntimeError:
             continue
@@ -928,6 +951,7 @@ def candidate_subway_route(
                         allowed_edge_types=walk_edge_types,
                         apply_long_walk_penalty=False,
                         apply_transfer_penalty=False,
+                        virtual_adjacency=virtual_adjacency,
                     )
                 subway_key = (start_station_id, end_station_id)
                 if subway_key not in subway_cache:
@@ -938,6 +962,7 @@ def candidate_subway_route(
                         allowed_edge_types=subway_edge_types,
                         apply_long_walk_penalty=False,
                         apply_transfer_penalty=True,
+                        virtual_adjacency=virtual_adjacency,
                     )
             except RuntimeError:
                 continue
@@ -969,33 +994,48 @@ def build_route_geojson(
     conn: sqlite3.Connection,
     start_query: str,
     end_query: str,
-    adjacency: dict[str, list[tuple[str, float, float, str, str, str | None]]] | None = None,
+    adjacency: AdjacencyMap | None = None,
 ) -> dict[str, Any]:
     start = resolve_location_any(conn, start_query)
     end = resolve_location_any(conn, end_query)
     base_graph = adjacency if adjacency is not None else load_adjacency(conn)
-    graph = {node_id: list(edges) for node_id, edges in base_graph.items()}
     virtual_edges: dict[str, dict[str, Any]] = {}
-    start_node = add_virtual_snap_node(graph, virtual_edges, conn, start, "start")
-    end_node = add_virtual_snap_node(graph, virtual_edges, conn, end, "end")
+    virtual_overlay: dict[str, list[Edge]] = {}
+    start_node = add_virtual_snap_node(virtual_overlay, virtual_edges, conn, start, "start")
+    end_node = add_virtual_snap_node(virtual_overlay, virtual_edges, conn, end, "end")
+    virtual_adjacency: VirtualAdjacencyMap = {node_id: tuple(edges) for node_id, edges in virtual_overlay.items()}
     direct_distance_m = haversine_m((start.lon, start.lat), (end.lon, end.lat))
     route_info: dict[str, Any] = {"routing_strategy": "single_graph"}
     if direct_distance_m <= DIRECT_WALK_LIMIT_M:
         cost, steps = dijkstra(
-            graph,
+            base_graph,
             start_node["node_id"],
             end_node["node_id"],
             allowed_edge_types=set(WALK_LIKE_EDGE_TYPES),
             apply_long_walk_penalty=False,
             apply_transfer_penalty=False,
+            virtual_adjacency=virtual_adjacency,
         )
         route_info["routing_strategy"] = "direct_walk"
     else:
-        station_route = candidate_subway_route(conn, graph, start, end, start_node, end_node)
+        station_route = candidate_subway_route(
+            conn,
+            base_graph,
+            start,
+            end,
+            start_node,
+            end_node,
+            virtual_adjacency=virtual_adjacency,
+        )
         if station_route:
             cost, steps, route_info = station_route
         else:
-            cost, steps = dijkstra(graph, start_node["node_id"], end_node["node_id"])
+            cost, steps = dijkstra(
+                base_graph,
+                start_node["node_id"],
+                end_node["node_id"],
+                virtual_adjacency=virtual_adjacency,
+            )
     features = fetch_edges(conn, steps, virtual_edges)
     summary = summarize_route(features, cost, start, end)
     summary["start_snap_node"] = start_node

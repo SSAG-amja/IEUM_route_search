@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,6 +17,12 @@ from .services import RoutingService, VoiceService
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO_WEB = ROOT / "demo" / "web"
+LOG_LEVEL = os.environ.get("IEUM_LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 
 @asynccontextmanager

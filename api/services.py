@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 import gzip
 import json
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -35,6 +36,8 @@ sys.path.append(str(ROUTING_PATH))
 
 import route_engine  # noqa: E402
 import route_instructions  # noqa: E402
+
+logger = logging.getLogger("ieum.api")
 
 
 DATASET_FILES = {
@@ -199,6 +202,7 @@ class VoiceService:
         with self._model_lock:
             model = self.whisper_model
             if model is None:
+                started_at = time.perf_counter()
                 model = Model(
                     "tiny",
                     n_threads=max(1, os.cpu_count() or 1),
@@ -206,6 +210,7 @@ class VoiceService:
                     print_progress=False,
                 )
                 self.whisper_model = model
+                logger.info("voice.whisper_loaded model=tiny load_ms=%.1f", (time.perf_counter() - started_at) * 1000)
         return model
 
     def is_ready(self) -> bool:

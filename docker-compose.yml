@@ -1,0 +1,18 @@
+services:
+  ieum-route-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ieum-route-api
+    restart: always
+    env_file:
+      - .env
+    environment:
+      IEUM_ROUTE_HOST: 0.0.0.0
+      IEUM_ROUTE_PORT: 8000
+      IEUM_ROUTE_DB_PATH: /app/storage/ieum_graph.sqlite
+      IEUM_CORS_ORIGINS: http://52.78.2.168,http://localhost:8081,http://127.0.0.1:8081,http://localhost:19006,http://127.0.0.1:19006
+    ports:
+      - "127.0.0.1:8020:8000"
+    volumes:
+      - ./storage:/app/storage

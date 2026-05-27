@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import gzip
 import math
@@ -12,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parent
 NAV_DATA = WORKSPACE_ROOT / "nav_map" / "web" / "data"
 LOCAL_LAYER_GZ = ROOT / "data_gz" / "layers"
-DB_PATH = ROOT / "routing" / "ieum_graph.sqlite"
+DB_PATH = Path(os.environ.get("IEUM_ROUTE_DB_PATH", str(ROOT / "routing" / "ieum_graph.sqlite"))).expanduser()
 NON_ELEVATOR_STATION_CONNECTOR_PENALTY = 650.0
 
 

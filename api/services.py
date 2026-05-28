@@ -8,7 +8,6 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-
 import gzip
 import json
 import sqlite3
@@ -18,6 +17,7 @@ import urllib.request
 from threading import RLock
 from typing import Any
 from uuid import uuid4
+import dotenv
 
 from .schemas import LocationInput, RouteCreateRequest, RouteLeg, RouteResponse, RouteStep
 
@@ -34,7 +34,8 @@ sys.path.append(str(ROUTING_PATH))
 import route_engine  # noqa: E402
 import route_instructions  # noqa: E402
 
-logger = logging.getLogger("ieum.api.voice")
+
+load_dotenv()
 
 DATASET_FILES = {
     "braille": (NAV_DATA / "braille_network_links.geojson", LOCAL_LAYER_GZ / "braille_network_links.geojson.gz"),
@@ -164,17 +165,15 @@ class RoutingService:
             "features": response.geometry["features"],
         }
     
-gemini_api_key = os.environ.get("GEMINI_API_KEY")
+gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 
 gemini_config = types.GenerateContentConfig(
     system_instruction=(
-        "사용자의 텍스트에서 가고자 하는 최종 목적지의 검색 가능한 이름만 짧게 추출해. "
-        "오타가 있을 경우 실제 장소명으로 자연스럽게 보정해. "
-        "조사, 서술어, 수식어는 제거하고 장소명이나 주소만 반환해. "
-        "실제 카카오맵이나 지도 검색에서 나올 법한 가장 가까운 장소명으로 정규화해. "
-        "예: '항꾺체육대학교' -> '한국체육대학교', '서울때 학교' -> '서울대학교'. "
-        "목적지가 명확하지 않으면 None이라고만 답해."
+        "오타나 발음 오류를 실제 장소명이나 주소 1개로 고쳐 써. "
+        "조사와 요청말은 빼고 정답만 답해. "
+        "예: 항꾺체육대학교->한국체육대학교, 서울때 학교->서울대학교, 올링픽회광->올림픽회관. "
+        "모르면 NONE."
     ),
     temperature=0.0,
     max_output_tokens=20,
@@ -206,10 +205,6 @@ class VoiceService:
         "군",
         "구",
         "읍",
-        "면",
-        "동",
-        "리",
-        "가",
     )
 
     def open(self) -> None:
@@ -224,12 +219,17 @@ class VoiceService:
     async def extract_destination(self, text: str) -> str:
         if not text.strip() or self.conn is None:
             return ""
-        primary = self._normalize_for_search(text)
-        for candidate in self._build_candidates(primary):
+        raw = text.strip()
+        resolved = self._resolve_candidate(raw)
+        if resolved:
+            return resolved
+        candidate = self._secondary_candidate(raw)
+        if candidate and candidate != raw:
             resolved = self._resolve_candidate(candidate)
             if resolved:
                 return resolved
-        gemini_candidate = await self._extract_with_gemini(primary)
+        gemini_seed = candidate or self._normalize_for_search(raw)
+        gemini_candidate = await self._extract_with_gemini(gemini_seed)
         if gemini_candidate:
             resolved = self._resolve_candidate(gemini_candidate)
             if resolved:
@@ -256,21 +256,22 @@ class VoiceService:
         normalized = re.sub(r"(\d[\d-]*)(?:으로|로|까지)$", r"\1", normalized)
         return normalized
 
-    def _build_candidates(self, primary: str) -> list[str]:
-        candidates: list[str] = []
-
-        def add(candidate: str) -> None:
-            candidate = candidate.strip(" \t\r\n,?.!")
-            if not candidate or candidate in candidates:
-                return
-            candidates.append(candidate)
-
-        add(primary)
+    def _secondary_candidate(self, raw: str) -> str:
+        primary = self._normalize_for_search(raw)
         stripped = self._strip_particle_candidate(primary)
-        add(stripped)
-        compact = self._compact_last_phrase(stripped or primary)
-        add(compact)
-        return candidates
+        candidate = stripped or primary
+        if candidate and not self._looks_like_address_input(candidate) and " " in candidate:
+            compact = self._compact_no_space_candidate(candidate)
+            if compact:
+                return compact
+        return candidate
+
+    def _compact_no_space_candidate(self, text: str) -> str:
+        if " " not in text:
+            return text
+        if self._looks_like_address_input(text):
+            return text
+        return text.replace(" ", "")
 
     def _strip_particle_candidate(self, text: str) -> str:
         if not text:
@@ -284,15 +285,6 @@ class VoiceService:
         if text.endswith("로"):
             return text[:-1].rstrip()
         return text
-
-    def _compact_last_phrase(self, text: str) -> str:
-        tokens = text.split()
-        if len(tokens) <= 1:
-            return text
-        last = tokens[-1]
-        if self._looks_like_address_token(last):
-            return text
-        return last
 
     def _looks_like_address_phrase(self, tokens: list[str]) -> bool:
         if any(char.isdigit() for char in " ".join(tokens)):
@@ -319,8 +311,8 @@ class VoiceService:
                 if self._looks_like_address_input(candidate) and not self._is_address_like_result(kakao.label):
                     return ""
                 return kakao.label
-        except Exception as exc:
-            logger.warning("Kakao lookup failed for %s: %s", candidate, exc)
+        except Exception:
+            pass
         fallback = route_engine.fallback_station_location(self.conn, candidate)
         if fallback:
             return fallback.label
@@ -330,15 +322,12 @@ class VoiceService:
         if not text or gemini_client is None:
             return ""
         try:
-            logger.info("Invoking Gemini for destination extraction: %s", text)
             response = await gemini_client.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-flash-lite",
                 contents=text,
                 config=gemini_config,
             )
-            logger.info("Gemini response: %s", response.text)
         except Exception as exc:
-            logger.warning("Gemini destination fallback failed: %s", exc)
             return ""
         extracted = (response.text or "").strip()
         if not extracted or extracted.lower() == "none":
@@ -380,6 +369,7 @@ class VoiceService:
             address = self._kakao_address_search(candidate)
             if address:
                 return address
+            return None
         return route_engine.kakao_keyword_search(candidate)
 
     def _kakao_address_search(self, query: str):

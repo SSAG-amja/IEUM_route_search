@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import os
 import subprocess
+import logging
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -12,6 +13,8 @@ import gzip
 import json
 import sqlite3
 import sys
+import urllib.parse
+import urllib.request
 from threading import RLock
 from typing import Any
 from uuid import uuid4
@@ -31,6 +34,7 @@ sys.path.append(str(ROUTING_PATH))
 import route_engine  # noqa: E402
 import route_instructions  # noqa: E402
 
+logger = logging.getLogger("ieum.api.voice")
 
 DATASET_FILES = {
     "braille": (NAV_DATA / "braille_network_links.geojson", LOCAL_LAYER_GZ / "braille_network_links.geojson.gz"),
@@ -160,46 +164,246 @@ class RoutingService:
             "features": response.geometry["features"],
         }
     
-# 1. 새 방식의 클라이언트 초기화
-gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 
-# 2. 시스템 프롬프트 및 설정 객체 생성
 gemini_config = types.GenerateContentConfig(
     system_instruction=(
-        "사용자의 텍스트에서 가고자 하는 '최종 목적지'의 명칭만 정확하게 추출해. "
-        "조사(로, 으로, 까지 등), 서술어(가줘, 안내해 등), 수식어는 절대 포함하지 마. "
-        "필수 : 오직 장소 이름만 단답형으로 출력해. (예: '서울역으로 가줘' -> '서울역') "
-        "목적지가 명확하지 않거나 없으면 'None'이라고 출력해."
-        "실제로 존재하는 장소를 반환해야해 장소가 정확하지 않더라도 실제로 네이버나 카카오 지도에서 검색 가능한 이름을 반환해."
+        "사용자의 텍스트에서 가고자 하는 최종 목적지의 검색 가능한 이름만 짧게 추출해. "
+        "오타가 있을 경우 실제 장소명으로 자연스럽게 보정해. "
+        "조사, 서술어, 수식어는 제거하고 장소명이나 주소만 반환해. "
+        "실제 카카오맵이나 지도 검색에서 나올 법한 가장 가까운 장소명으로 정규화해. "
+        "예: '항꾺체육대학교' -> '한국체육대학교', '서울때 학교' -> '서울대학교'. "
+        "목적지가 명확하지 않으면 None이라고만 답해."
     ),
     temperature=0.0,
     max_output_tokens=20,
 )
 
+
 class VoiceService:
     def __init__(self) -> None:
-        pass
+        self.conn: sqlite3.Connection | None = None
+
+    _leading_noise_pattern = re.compile(r"^(?:음|아|어|저기)\s+")
+    _request_suffixes = (
+        "안내해줘",
+        "안내해주세요",
+        "가고 싶어",
+        "가고싶어",
+        "가줘",
+        "가주세요",
+        "어디야",
+        "알려줘",
+        "알려주세요",
+        "말해줘",
+        "말해주세요",
+    )
+    _soft_suffixes = ("쪽으로", "근처로", "방면으로")
+    _road_suffixes = ("로", "길", "대로", "번길")
+    _address_tokens = (
+        "시",
+        "군",
+        "구",
+        "읍",
+        "면",
+        "동",
+        "리",
+        "가",
+    )
 
     def open(self) -> None:
-        return None
+        ensure_runtime_db()
+        self.conn = sqlite3.connect(route_engine.DB_PATH, check_same_thread=False)
 
     def close(self) -> None:
-        return None
+        if self.conn is not None:
+            self.conn.close()
+        self.conn = None
 
     async def extract_destination(self, text: str) -> str:
-        if not text.strip():
+        if not text.strip() or self.conn is None:
+            return ""
+        primary = self._normalize_for_search(text)
+        for candidate in self._build_candidates(primary):
+            resolved = self._resolve_candidate(candidate)
+            if resolved:
+                return resolved
+        gemini_candidate = await self._extract_with_gemini(primary)
+        if gemini_candidate:
+            resolved = self._resolve_candidate(gemini_candidate)
+            if resolved:
+                return resolved
+        return ""
+
+    def _normalize_for_search(self, text: str) -> str:
+        normalized = re.sub(r"[,.!?]+", " ", text)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        while True:
+            updated = self._leading_noise_pattern.sub("", normalized)
+            updated = updated.strip()
+            if updated == normalized:
+                break
+            normalized = updated
+        for suffix in self._request_suffixes:
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)].rstrip()
+                break
+        for suffix in self._soft_suffixes:
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)].rstrip()
+                break
+        normalized = re.sub(r"(\d[\d-]*)(?:으로|로|까지)$", r"\1", normalized)
+        return normalized
+
+    def _build_candidates(self, primary: str) -> list[str]:
+        candidates: list[str] = []
+
+        def add(candidate: str) -> None:
+            candidate = candidate.strip(" \t\r\n,?.!")
+            if not candidate or candidate in candidates:
+                return
+            candidates.append(candidate)
+
+        add(primary)
+        stripped = self._strip_particle_candidate(primary)
+        add(stripped)
+        compact = self._compact_last_phrase(stripped or primary)
+        add(compact)
+        return candidates
+
+    def _strip_particle_candidate(self, text: str) -> str:
+        if not text:
+            return text
+        for particle in ("으로", "까지"):
+            if text.endswith(particle):
+                return text[: -len(particle)].rstrip()
+        tokens = text.split()
+        if len(tokens) >= 2 and self._looks_like_address_phrase(tokens):
+            return text
+        if text.endswith("로"):
+            return text[:-1].rstrip()
+        return text
+
+    def _compact_last_phrase(self, text: str) -> str:
+        tokens = text.split()
+        if len(tokens) <= 1:
+            return text
+        last = tokens[-1]
+        if self._looks_like_address_token(last):
+            return text
+        return last
+
+    def _looks_like_address_phrase(self, tokens: list[str]) -> bool:
+        if any(char.isdigit() for char in " ".join(tokens)):
+            return True
+        if len(tokens) < 2:
+            return False
+        return self._looks_like_address_token(tokens[-1]) and any(
+            token.endswith(self._address_tokens) for token in tokens[:-1]
+        )
+
+    def _looks_like_address_token(self, token: str) -> bool:
+        if any(char.isdigit() for char in token):
+            return True
+        if token.endswith(self._road_suffixes):
+            return True
+        return token.endswith(self._address_tokens)
+
+    def _resolve_candidate(self, candidate: str) -> str:
+        if not candidate or self.conn is None:
             return ""
         try:
-            response = await gemini_client.aio.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=text,
-                config=gemini_config
-            )
-            extracted = response.text.strip()
-            return "" if extracted.lower() == "none" or not extracted else extracted
+            kakao = self._search_kakao(candidate)
+            if kakao:
+                if self._looks_like_address_input(candidate) and not self._is_address_like_result(kakao.label):
+                    return ""
+                return kakao.label
         except Exception as exc:
-            print(f"Gemini API Error: {exc}")
+            logger.warning("Kakao lookup failed for %s: %s", candidate, exc)
+        fallback = route_engine.fallback_station_location(self.conn, candidate)
+        if fallback:
+            return fallback.label
+        return ""
+
+    async def _extract_with_gemini(self, text: str) -> str:
+        if not text or gemini_client is None:
             return ""
+        try:
+            logger.info("Invoking Gemini for destination extraction: %s", text)
+            response = await gemini_client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=text,
+                config=gemini_config,
+            )
+            logger.info("Gemini response: %s", response.text)
+        except Exception as exc:
+            logger.warning("Gemini destination fallback failed: %s", exc)
+            return ""
+        extracted = (response.text or "").strip()
+        if not extracted or extracted.lower() == "none":
+            return ""
+        normalized = self._normalize_for_search(extracted)
+        if not self._is_valid_gemini_candidate(text, normalized):
+            return ""
+        return normalized
+
+    def _looks_like_address_input(self, text: str) -> bool:
+        compact = text.replace(" ", "")
+        if any(char.isdigit() for char in compact):
+            return True
+        tokens = text.split()
+        if len(tokens) >= 2 and self._looks_like_address_phrase(tokens):
+            return True
+        return any(token.endswith(self._road_suffixes) for token in tokens)
+
+    def _is_address_like_result(self, label: str) -> bool:
+        compact = label.replace(" ", "")
+        if any(char.isdigit() for char in compact):
+            return True
+        tokens = label.split()
+        if len(tokens) >= 2 and self._looks_like_address_phrase(tokens):
+            return True
+        return any(token.endswith(self._road_suffixes) for token in tokens)
+
+    def _is_valid_gemini_candidate(self, source_text: str, candidate: str) -> bool:
+        if not candidate:
+            return False
+        if len(candidate.replace(" ", "")) < 2:
+            return False
+        if any(char.isdigit() for char in source_text) and not any(char.isdigit() for char in candidate):
+            return False
+        return True
+
+    def _search_kakao(self, candidate: str):
+        if self._looks_like_address_input(candidate):
+            address = self._kakao_address_search(candidate)
+            if address:
+                return address
+        return route_engine.kakao_keyword_search(candidate)
+
+    def _kakao_address_search(self, query: str):
+        api_key = route_engine.load_env().get("KAKAO_REST_API_KEY")
+        if not api_key:
+            return None
+        params = urllib.parse.urlencode({"query": query, "size": 1})
+        request = urllib.request.Request(
+            f"https://dapi.kakao.com/v2/local/search/address.json?{params}",
+            headers={"Authorization": f"KakaoAK {api_key}"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        docs = payload.get("documents") or []
+        if not docs:
+            return None
+        first = docs[0]
+        label = first.get("address_name") or first.get("road_address", {}).get("address_name") or query
+        return route_engine.Location(
+            label=label,
+            lon=float(first["x"]),
+            lat=float(first["y"]),
+            source="kakao.address",
+        )
 
 def load_dataset(name: str) -> dict[str, Any]:
     candidates = DATASET_FILES.get(name)

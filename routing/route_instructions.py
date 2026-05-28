@@ -18,29 +18,27 @@ LOCAL_SUBWAY_CATALOG_GZ = ROOT / "data_gz" / "source" / "subway_station_catalog"
 
 INSTRUCTION_TEMPLATES: dict[str, list[str]] = {
     "route_start": [
-        "현재 위치에서 안내를 시작합니다.",
-        "보도 구간에서는 GPS 위치와 진행 방향을 기준으로 안내합니다.",
-        "차량 소리, 보행자 흐름, 공사 구간 등 주변 상황을 함께 확인하세요.",
+        "안내를 시작합니다.",
+        "주변 상황에 유의하세요.",
     ],
     "walk_with_braille": [
         "점자블록을 따라 {distance_m}미터 이동하세요.",
-        "이 구간은 경로 주변에 점자블록 데이터가 확인됩니다. 점자블록을 우선 기준으로 이동하세요.",
     ],
     "walk": [
         "보행로를 따라 {distance_m}미터 이동하세요.",
-        "이 구간은 경로에 반영된 점자블록 정보가 부족합니다. 보행로 경계와 주변 소리를 확인하며 이동하세요.",
+        "이 구간은 점자블록 정보가 부족합니다. 보행로 경계와 주변소리를 확인하며 이동하세요.",
     ],
     "crosswalk": [
-        "횡단보도를 {distance_m}미터 건너세요.",
-        "음향신호기가 있으면 음향 안내와 보행 신호를 확인한 뒤 건너세요.",
-        "음향신호기 정보가 없으면 차량 흐름과 보행 신호를 다시 확인하세요.",
+        "{distance_m}미터 횡단보도를 건너세요.",
+        "횡단보도에 진입했습니다. 음향안내와 보행 신호를 확인하고 건너세요.",
+        "차량 소리와 신호를 확인하세요.",
     ],
     "subway_entry": [
         "{station_name}역 입구에 도착했습니다.",
         "역 안에서는 GPS 안내를 사용하지 않습니다. 이동을 마치면 화면을 네 번 터치해주세요.",
     ],
     "subway_ride": [
-        "{line_name}을 이용해 {from_station}에서 {to_station}까지 {edge_count}개 구간 이동하세요.",
+        "{line_name}을 타고 {from_station}에서 {to_station}까지 총 {edge_count}개 구간 이동하세요.",
         "승차 전 승강장과 열차 사이 간격을 확인하세요.",
     ],
     "transfer": [
@@ -51,12 +49,12 @@ INSTRUCTION_TEMPLATES: dict[str, list[str]] = {
         "{station_name}역 안에서 {step}. 이동을 마치면 화면을 네 번 터치해주세요.",
     ],
     "subway_exit": [
-        "{station_name}역 밖으로 이동하세요. 역 밖으로 나왔다면 화면을 네 번 터치해주세요.",
+        "{station_name}역 밖으로 나간 후 화면을 네 번 터치해주세요.",
         "확인 후 GPS 안내를 다시 시작합니다.",
     ],
     "station_passage": [
-        "{station_name}역 안에서는 GPS 안내를 사용하지 않습니다.",
-        "역 밖으로 이동한 뒤 화면을 네 번 터치해주세요. 확인 후 GPS 안내를 다시 시작합니다.",
+        "{station_name}역 안을 지나 역 밖으로 이동하세요.",
+        "엘리베이터 또는 안내 동선을 따라 역 밖으로 이동한 뒤 화면을 네 번 터치해주세요. 확인 후 GPS 안내를 다시 시작합니다.",
     ],
     "facility_connector": [
         "엘리베이터 또는 접근성 시설 연결 구간을 {distance_m}미터 이동하세요.",
@@ -244,6 +242,61 @@ def station_api_code(station: dict[str, Any] | None, line_code: str | None) -> s
     return None
 
 
+def truthy_flag(value: Any) -> bool:
+    return str(value or "").strip().upper() in {"Y", "YES", "TRUE", "1", "O", "있음", "유"}
+
+
+def station_line_records(station: dict[str, Any] | None, field: str, line_code: str | None) -> list[dict[str, Any]]:
+    if not station:
+        return []
+    records = [item for item in station.get(field) or [] if isinstance(item, dict)]
+    if not line_code:
+        return records
+    filtered = [item for item in records if str(item.get("lnCd") or "") == str(line_code)]
+    return filtered or records
+
+
+def platform_gap_description(avg_gap_cm: float) -> str:
+    if avg_gap_cm >= 12:
+        return "먼 편입니다"
+    if avg_gap_cm <= 7:
+        return "가까운 편입니다"
+    return "보통입니다"
+
+
+def subway_boarding_safety_text(station_name: str, line_code: str | None) -> str:
+    station = station_catalog(station_name)
+    if not station:
+        return "탑승 전 스크린도어와 열차 간격을 확인하세요."
+
+    screen_records = station_line_records(station, "screen_doors", line_code)
+    safety_records = station_line_records(station, "safety_platforms", line_code)
+    gap_records = station_line_records(station, "platform_train_distances", line_code)
+
+    gap_values = []
+    for item in gap_records:
+        try:
+            gap_values.append(float(item.get("sfDst")))
+        except (TypeError, ValueError):
+            continue
+
+    clauses = []
+    if gap_values:
+        avg_gap_cm = sum(gap_values) / len(gap_values)
+        clauses.append(f"열차와 승강장 간격은 {platform_gap_description(avg_gap_cm)}.")
+
+    if screen_records:
+        has_screen_door = any(truthy_flag(item.get("scrCharExt")) for item in screen_records)
+        clauses.append("스크린도어는 있고" if has_screen_door else "스크린도어 정보는 없고")
+    if safety_records:
+        has_safety_platform = any(truthy_flag(item.get("sfFotExt")) for item in safety_records)
+        clauses.append("안전발판은 있습니다." if has_safety_platform else "안전발판은 없습니다.")
+
+    if not clauses:
+        return "탑승 전 스크린도어와 열차 간격을 확인하세요."
+    return f"탑승 안전정보입니다. {' '.join(clauses)}"
+
+
 def movement_group_key(record: dict[str, Any]) -> tuple[str, str]:
     return (
         str(record.get("mvPathMgNo") or record.get("nextStinCd") or "0"),
@@ -416,6 +469,10 @@ def distance_of(features: list[dict[str, Any]]) -> float:
     return round(sum(float((feature.get("properties") or {}).get("length_m") or 0) for feature in features), 1)
 
 
+def spoken_distance_m(value: Any) -> int:
+    return max(0, int(round(float(value or 0))))
+
+
 def has_near_braille(features: list[dict[str, Any]]) -> bool:
     return any(int((feature.get("properties") or {}).get("near_braille_count") or 0) > 0 for feature in features)
 
@@ -502,14 +559,15 @@ def append_walk_instructions(instructions: list[dict[str, Any]], group: list[dic
     follows_braille = has_near_braille(group)
     item_type = "walk_with_braille" if follows_braille else "walk"
     base = "점자블록을 따라" if follows_braille else "보행로를 따라"
-    suffix = "" if follows_braille else " 이 구간은 경로에 반영된 점자블록 정보가 부족합니다."
+    suffix = "" if follows_braille else " 이 구간은 점자블록 정보가 부족합니다. 보행로 경계와 주변소리를 확인하며 이동하세요."
     for idx, segment in enumerate(walk_segments(group)):
         direction = segment["direction"]
         distance = segment["distance_m"]
+        spoken_distance = spoken_distance_m(distance)
         if idx == 0 and direction == "직진으로":
-            text = f"{base} 약 {distance}미터 이동하세요.{suffix}"
+            text = f"{base} {spoken_distance}미터 이동하세요.{suffix}"
         else:
-            text = f"{direction} {base} 약 {distance}미터 이동하세요.{suffix}"
+            text = f"{direction} {base} {spoken_distance}미터 이동하세요.{suffix}"
         instructions.append(instruction(item_type, text, distance_m=distance, direction=direction))
 
 
@@ -555,8 +613,8 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
     props = route_geojson.get("properties") or {}
     features = route_geojson.get("features") or []
     instructions: list[dict[str, Any]] = [
-        instruction("route_start", "현재 위치에서 안내를 시작합니다."),
-        instruction("route_start", "보도 구간에서는 GPS 위치와 진행 방향을 기준으로 안내합니다."),
+        instruction("route_start", "안내를 시작합니다."),
+        instruction("route_start", "주변 상황에 유의하세요."),
     ]
 
     last_subway_line: str | None = None
@@ -567,6 +625,7 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
         last_props = group[-1].get("properties") or {}
         edge_type = first_props.get("edge_type")
         dist = distance_of(group)
+        spoken_dist = spoken_distance_m(dist)
         if dist < 1 and edge_type not in {"subway_ride"}:
             continue
 
@@ -578,11 +637,11 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             has_audible = any((f.get("properties") or {}).get("has_audible_signal") for f in group)
             has_signal = any((f.get("properties") or {}).get("has_ped_signal") for f in group)
             if has_audible:
-                text = f"음향신호기가 있는 횡단보도를 약 {dist}미터 건너세요. 음향 안내와 보행 신호를 확인하세요."
+                text = f"횡단보도에 진입했습니다. 음향안내와 보행 신호를 확인하고 {spoken_dist}미터 건너세요."
             elif has_signal:
-                text = f"보행신호가 있는 횡단보도를 약 {dist}미터 건너세요. 음향신호기 정보는 확인되지 않습니다."
+                text = f"{spoken_dist}미터 횡단보도를 건너세요. 음향신호기 정보가 확인되지 않습니다."
             else:
-                text = f"횡단보도를 약 {dist}미터 건너세요. 신호와 음향신호기 정보가 부족하므로 차량 흐름을 확인하세요."
+                text = f"{spoken_dist}미터 횡단보도를 건너세요. 차량 소리를 확인하세요."
             instructions.append(instruction("crosswalk", text, distance_m=dist))
             continue
 
@@ -602,10 +661,9 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
                     instructions.append(
                         instruction(
                             "subway_exit",
-                            f"{station_name}역에서 지상 출구 또는 엘리베이터를 따라 역 밖으로 이동하세요. "
+                            f"{station_name}역 밖으로 나간 후 화면을 네 번 터치해주세요. "
                             f"{voice_suffix.strip()} "
-                            "역 밖으로 나왔다면 화면을 네 번 터치해주세요. "
-                            "확인 후 GPS 안내를 다시 시작해 목적지까지 이동합니다.",
+                            "확인 후 GPS 안내를 다시 시작합니다.",
                             station_name=station_name,
                             voice_guidance_devices=exit_devices,
                             indoor_data_confidence="catalog_text",
@@ -642,8 +700,7 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
                         instructions.append(
                             instruction(
                                 "subway_internal",
-                                f"{station_name}역 음성유도기 안내: {entry_voice_text} "
-                                "음성유도기 위치를 보조 기준으로 확인하며 이동하세요.",
+                                f"{entry_voice_text} 음성유도기를 확인하며 이동하세요.",
                                 station_name=station_name,
                                 line_code=line_code,
                                 voice_guidance_devices=entry_devices,
@@ -682,20 +739,19 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
                     instructions.append(
                         instruction(
                             "station_passage",
-                            f"{station_name}역 안을 통과하는 접근성 이동 구간입니다. "
-                            "역 안에서는 GPS 안내를 사용하지 않습니다. "
+                            f"{station_name}역 안을 지나 역 밖으로 이동하세요. "
                             "엘리베이터 또는 안내 동선을 따라 역 밖으로 이동한 뒤 화면을 네 번 터치해주세요. "
                             "확인 후 GPS 안내를 다시 시작합니다.",
                             station_name=station_name,
                         )
                     )
             else:
-                instructions.append(instruction("subway_connector", f"지하철역 연결 구간을 약 {dist}미터 이동하세요.", distance_m=dist))
+                instructions.append(instruction("subway_connector", f"지하철역 연결 구간을 {spoken_dist}미터 이동하세요.", distance_m=dist))
             continue
 
         if edge_type == "facility_connector":
             instructions.append(
-                instruction("facility_connector", f"엘리베이터 또는 접근성 시설 연결 구간을 약 {dist}미터 이동하세요.", distance_m=dist)
+                instruction("facility_connector", f"엘리베이터 또는 접근성 시설 연결 구간을 {spoken_dist}미터 이동하세요.", distance_m=dist)
             )
             continue
 
@@ -704,12 +760,13 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             line_name = str(first_props.get("line_name") or f"{line_code}호선")
             from_name = station_name_from_node(first_props.get("route_from_node"), first_props.get("route_from_node_id"))
             to_name = station_name_from_node(last_props.get("route_to_node"), last_props.get("route_to_node_id"))
+            safety_text = subway_boarding_safety_text(from_name, line_code)
             if last_subway_line and line_code != last_subway_line:
                 transfer_next_station_name = station_name_from_node(first_props.get("route_to_node"), first_props.get("route_to_node_id"))
                 instructions.append(
                     instruction(
                         "transfer",
-                        f"{from_name}역에서 {last_subway_line}호선에서 {line_name}으로 환승합니다. "
+                        f"{from_name}역 {last_subway_line}호선에서 {line_name}으로 환승하세요. "
                         "환승 이동 안내를 시작하려면 화면을 네 번 터치해주세요.",
                         station_name=from_name,
                     )
@@ -746,7 +803,8 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             instructions.append(
                 instruction(
                     "subway_ride",
-                    f"{line_name}을 이용해 {from_name}역에서 {to_name}역까지 {len(group)}개 구간 이동하세요. "
+                    f"{line_name}을 타고 {from_name}역에서 {to_name}역까지 총 {len(group)}개 구간 이동하세요. "
+                    f"{safety_text} "
                     f"{to_name}역에 도착하면 화면을 네 번 터치해주세요.",
                     line_code=line_code,
                     from_station=from_name,
@@ -760,9 +818,9 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             continue
 
         if edge_type == "crosswalk_connector":
-            instructions.append(instruction("move", f"횡단보도 접근 연결부를 약 {dist}미터 이동하세요.", distance_m=dist))
+            instructions.append(instruction("move", f"횡단보도 접근 연결부를 {spoken_dist}미터 이동하세요.", distance_m=dist))
         else:
-            instructions.append(instruction("move", f"{edge_type} 구간을 약 {dist}미터 이동하세요.", distance_m=dist))
+            instructions.append(instruction("move", f"{edge_type} 구간을 {spoken_dist}미터 이동하세요.", distance_m=dist))
 
     end_label = (props.get("end") or {}).get("label") or "목적지"
     instructions.append(instruction("destination", f"{end_label} 주변에 도착했습니다. 안내를 종료합니다."))

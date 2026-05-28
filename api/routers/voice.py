@@ -26,14 +26,11 @@ async def destination(body: TextBody, request: Request):
     service = service_from(request)
     
     try:
-        gemini_started_at = time.perf_counter()
         dest = await service.extract_destination(text)
-        gemini_ms = (time.perf_counter() - gemini_started_at) * 1000
         total_ms = (time.perf_counter() - total_started_at) * 1000
         logger.info(
-            "voice.destination request_id=%s gemini_ms=%.1f total_ms=%.1f text_len=%d dest_len=%d status=ok",
+            "voice.destination request_id=%s total_ms=%.1f text_len=%d dest_len=%d status=ok",
             request_id,
-            gemini_ms,
             total_ms,
             len(text),
             len(dest),

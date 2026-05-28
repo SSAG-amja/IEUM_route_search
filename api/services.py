@@ -34,6 +34,7 @@ sys.path.append(str(ROUTING_PATH))
 import route_engine  # noqa: E402
 import route_instructions  # noqa: E402
 
+logger = logging.getLogger("ieum.api.voice")
 
 load_dotenv()
 
@@ -220,20 +221,28 @@ class VoiceService:
         if not text.strip() or self.conn is None:
             return ""
         raw = text.strip()
+        logger.info("destination.stage1.start query=%s", raw)
         resolved = self._resolve_candidate(raw)
+        logger.info("destination.stage1.end query=%s result=%s", raw, resolved or "")
         if resolved:
             return resolved
         candidate = self._secondary_candidate(raw)
         if candidate and candidate != raw:
+            logger.info("destination.stage2.start query=%s", candidate)
             resolved = self._resolve_candidate(candidate)
+            logger.info("destination.stage2.end query=%s result=%s", candidate, resolved or "")
             if resolved:
                 return resolved
         gemini_seed = candidate or self._normalize_for_search(raw)
+        logger.info("destination.stage3.start query=%s", gemini_seed)
         gemini_candidate = await self._extract_with_gemini(gemini_seed)
         if gemini_candidate:
             resolved = self._resolve_candidate(gemini_candidate)
+            logger.info("destination.stage3.end query=%s result=%s", gemini_candidate, resolved or "")
             if resolved:
                 return resolved
+        else:
+            logger.info("destination.stage3.end query=%s result=", gemini_seed)
         return ""
 
     def _normalize_for_search(self, text: str) -> str:
@@ -322,12 +331,15 @@ class VoiceService:
         if not text or gemini_client is None:
             return ""
         try:
+            logger.info("destination.gemini.request query=%s", text)
             response = await gemini_client.aio.models.generate_content(
                 model="gemini-2.5-flash-lite",
                 contents=text,
                 config=gemini_config,
             )
+            logger.info("destination.gemini.response query=%s result=%s", text, response.text or "")
         except Exception as exc:
+            logger.warning("destination.gemini.error query=%s detail=%s", text, exc)
             return ""
         extracted = (response.text or "").strip()
         if not extracted or extracted.lower() == "none":

@@ -140,6 +140,45 @@ IEUM_ROUTE_PORT=8021 python routing/route_server.py
 IEUM_ROUTE_HOST=127.0.0.1 python routing/route_server.py
 ```
 
+## Docker 실행 및 업데이트
+
+EC2에서 Docker Compose로 실행할 때는 아래 명령으로 백그라운드 실행합니다.
+
+```bash
+docker compose up -d --build
+```
+
+현재 구성은 소스 전체를 `/app`에 bind mount하고 `uvicorn --reload`로 실행합니다.  
+따라서 컨테이너가 백그라운드에서 실행 중이어도:
+
+```bash
+git pull
+```
+
+만 하면 `api/`, `routing/` 코드 변경은 자동으로 감지되어 재시작됩니다.
+
+주의:
+
+- `requirements.txt`가 바뀌면 자동 설치되지 않으므로 아래를 다시 실행해야 합니다.
+
+```bash
+docker compose up -d --build
+```
+
+- SQLite는 `storage/ieum_graph.sqlite`를 계속 사용합니다.
+
+로그 확인:
+
+```bash
+docker compose logs -f ieum-route-api
+```
+
+Nginx access log:
+
+```bash
+sudo tail -f /var/log/nginx/access.log
+```
+
 ## 첫 실행 동작
 
 `routing/ieum_graph.sqlite`가 없으면 서버가 자동으로 다음 작업을 수행합니다.

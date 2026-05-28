@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ieum-route-api
+    working_dir: /app
     restart: always
     env_file:
       - .env
@@ -17,4 +18,11 @@ services:
     ports:
       - "127.0.0.1:8020:8000"
     volumes:
-      - ./storage:/app/storage
+      - ./:/app
+    command: >
+      uvicorn api.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/api
+      --reload-dir /app/routing

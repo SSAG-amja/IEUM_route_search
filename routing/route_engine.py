@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import gzip
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -29,6 +30,7 @@ TRANSIT_CONGESTION_GZ = SOURCE_GZ / "transit_congestion_catalog"
 DB_PATH = Path(os.environ.get("IEUM_ROUTE_DB_PATH", str(ROOT / "routing" / "ieum_graph.sqlite"))).expanduser()
 ENV_PATH = ROOT / ".env"
 RESULTS_DIR = ROOT / "routing" / "results"
+logger = logging.getLogger("ieum.route_engine")
 TRANSFER_PENALTY = 700.0
 ONE_STATION_WALK_M = 900.0
 LONG_WALK_PENALTY_PER_M = 0.7
@@ -1261,16 +1263,28 @@ def build_route_geojson(
     end_query: str,
     adjacency: AdjacencyMap | None = None,
 ) -> dict[str, Any]:
+    logger.info("route.build.start start_query=%s end_query=%s", start_query, end_query)
     start = resolve_location_any(conn, start_query)
     end = resolve_location_any(conn, end_query)
+    logger.info(
+        "route.build.resolved start_label=%s start_lon=%s start_lat=%s end_label=%s end_lon=%s end_lat=%s",
+        start.label,
+        start.lon,
+        start.lat,
+        end.label,
+        end.lon,
+        end.lat,
+    )
     base_graph = adjacency if adjacency is not None else load_adjacency(conn)
     virtual_edges: dict[str, dict[str, Any]] = {}
     virtual_overlay: dict[str, list[Edge]] = {}
     start_node = add_virtual_snap_node(virtual_overlay, virtual_edges, conn, start, "start")
     end_node = add_virtual_snap_node(virtual_overlay, virtual_edges, conn, end, "end")
+    logger.info("route.build.snap start_node=%s end_node=%s", start_node, end_node)
     virtual_adjacency: VirtualAdjacencyMap = {node_id: tuple(edges) for node_id, edges in virtual_overlay.items()}
     direct_distance_m = haversine_m((start.lon, start.lat), (end.lon, end.lat))
     route_info: dict[str, Any] = {"routing_strategy": "single_graph"}
+    logger.info("route.build.distance direct_distance_m=%.1f", direct_distance_m)
     if direct_distance_m <= DIRECT_WALK_LIMIT_M:
         cost, steps = dijkstra(
             base_graph,
@@ -1282,7 +1296,9 @@ def build_route_geojson(
             virtual_adjacency=virtual_adjacency,
         )
         route_info["routing_strategy"] = "direct_walk"
+        logger.info("route.build.direct_walk cost=%s step_count=%d", cost, len(steps))
     else:
+        logger.info("route.build.try_subway_candidate")
         station_route = candidate_subway_route(
             conn,
             base_graph,
@@ -1294,13 +1310,29 @@ def build_route_geojson(
         )
         if station_route:
             cost, steps, route_info = station_route
+            logger.info(
+                "route.build.subway_selected strategy=%s cost=%s step_count=%d",
+                route_info.get("routing_strategy"),
+                cost,
+                len(steps),
+            )
         else:
+            logger.info("route.build.subway_unavailable fallback=single_graph")
             cost, steps = dijkstra(
                 base_graph,
                 start_node["node_id"],
                 end_node["node_id"],
                 virtual_adjacency=virtual_adjacency,
             )
+            logger.info("route.build.single_graph cost=%s step_count=%d", cost, len(steps))
+    if not steps:
+        logger.warning(
+            "route.build.not_found start_label=%s end_label=%s start_node=%s end_node=%s",
+            start.label,
+            end.label,
+            start_node,
+            end_node,
+        )
     features = fetch_edges(conn, steps, virtual_edges)
     summary = summarize_route(features, cost, start, end)
     summary["start_snap_node"] = start_node

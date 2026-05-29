@@ -166,8 +166,12 @@ class RoutingService:
             "features": response.geometry["features"],
         }
     
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
+GEMINI_API_KEYS = [
+    os.getenv("GEMINI_API_KEY1", "").strip(),
+    os.getenv("GEMINI_API_KEY2", "").strip(),
+    os.getenv("GEMINI_API_KEY3", "").strip(),
+]
+GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key]
 
 gemini_config = types.GenerateContentConfig(
     system_instruction=(
@@ -328,26 +332,48 @@ class VoiceService:
         return ""
 
     async def _extract_with_gemini(self, text: str) -> str:
-        if not text or gemini_client is None:
+        if not text or not GEMINI_API_KEYS:
             return ""
-        try:
-            logger.info("destination.gemini.request query=%s", text)
-            response = await gemini_client.aio.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=text,
-                config=gemini_config,
+        last_error: Exception | None = None
+        for index, api_key in enumerate(GEMINI_API_KEYS, start=1):
+            client = genai.Client(api_key=api_key)
+            try:
+                logger.info("destination.gemini.request key=%d query=%s", index, text)
+                response = await client.aio.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=text,
+                    config=gemini_config,
+                )
+                extracted = (response.text or "").strip()
+                logger.info("destination.gemini.response key=%d query=%s result=%s", index, text, extracted)
+                if not extracted or extracted.lower() == "none":
+                    return ""
+                normalized = self._normalize_for_search(extracted)
+                if not self._is_valid_gemini_candidate(text, normalized):
+                    return ""
+                return normalized
+            except Exception as exc:
+                last_error = exc
+                logger.warning("destination.gemini.error key=%d query=%s detail=%s", index, text, exc)
+                if self._is_gemini_quota_error(exc):
+                    continue
+                break
+        if last_error is not None:
+            logger.warning("destination.gemini.exhausted query=%s", text)
+        return ""
+
+    def _is_gemini_quota_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(
+            token in message
+            for token in (
+                "429",
+                "quota",
+                "resource_exhausted",
+                "rate limit",
+                "too many requests",
             )
-            logger.info("destination.gemini.response query=%s result=%s", text, response.text or "")
-        except Exception as exc:
-            logger.warning("destination.gemini.error query=%s detail=%s", text, exc)
-            return ""
-        extracted = (response.text or "").strip()
-        if not extracted or extracted.lower() == "none":
-            return ""
-        normalized = self._normalize_for_search(extracted)
-        if not self._is_valid_gemini_candidate(text, normalized):
-            return ""
-        return normalized
+        )
 
     def _looks_like_address_input(self, text: str) -> bool:
         compact = text.replace(" ", "")

@@ -6,7 +6,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+from fastapi.responses import JSONResponse
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -23,6 +26,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+logger = logging.getLogger("ieum.api")
 
 
 @asynccontextmanager
@@ -60,6 +64,19 @@ app.add_middleware(
 app.include_router(routes.router)
 app.include_router(support.router)
 app.include_router(voice.router)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = (await request.body()).decode("utf-8", errors="replace")
+    logger.warning(
+        "validation.error method=%s path=%s errors=%s body=%s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+        body,
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 if DEMO_WEB.exists():
     app.mount("/demo", StaticFiles(directory=str(DEMO_WEB), html=True), name="demo")

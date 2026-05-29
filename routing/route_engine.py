@@ -9,9 +9,11 @@ import sqlite3
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import route_instructions
 
@@ -20,6 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parent
 NAV_DATA = WORKSPACE_ROOT / "nav_map" / "web" / "data"
 LOCAL_LAYER_GZ = ROOT / "data_gz" / "layers"
+SOURCE_GZ = ROOT / "data_gz" / "source"
+SUBWAY_CATALOG_GZ = SOURCE_GZ / "subway_station_catalog"
+TRANSPORT_ACCESSIBILITY_GZ = SOURCE_GZ / "transport_accessibility_catalog"
+TRANSIT_CONGESTION_GZ = SOURCE_GZ / "transit_congestion_catalog"
 DB_PATH = Path(os.environ.get("IEUM_ROUTE_DB_PATH", str(ROOT / "routing" / "ieum_graph.sqlite"))).expanduser()
 ENV_PATH = ROOT / ".env"
 RESULTS_DIR = ROOT / "routing" / "results"
@@ -32,6 +38,13 @@ STATION_CANDIDATE_LIMIT = 5
 STATION_CANDIDATE_RADIUS_M = 1800.0
 DIRECT_WALK_LIMIT_M = 900.0
 EDGE_SNAP_RADIUS_M = 120.0
+SUBWAY_LINE_CONGESTION_WEIGHT = 0.12
+SUBWAY_STATION_CONGESTION_WEIGHT = 0.08
+SEOUL_TZ = timezone(timedelta(hours=9), name="Asia/Seoul")
+try:
+    SEOUL_TZ = ZoneInfo("Asia/Seoul")
+except ZoneInfoNotFoundError:
+    pass
 WALK_LIKE_EDGE_TYPES = {
     "walk",
     "braille_walk",
@@ -117,6 +130,204 @@ def read_geojson_features(path: Path) -> list[dict[str, Any]]:
         with gzip.open(gz_path, "rt", encoding="utf-8") as handle:
             return json.load(handle).get("features", [])
     return []
+
+
+def read_gzip_json(path: Path) -> Any:
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def compact_station_key(value: Any) -> str:
+    text = str(value or "").strip().replace(" ", "")
+    while "(" in text and ")" in text:
+        start = text.find("(")
+        end = text.find(")", start)
+        if end < start:
+            break
+        text = text[:start] + text[end + 1 :]
+    return text[:-1] if text.endswith("역") else text
+
+
+def compact_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return str(int(text))
+    return text
+
+
+@lru_cache(maxsize=1)
+def subway_station_code_index() -> dict[str, set[str]]:
+    path = SUBWAY_CATALOG_GZ / "station_line_nodes.json.gz"
+    if not path.exists():
+        return {}
+    index: dict[str, set[str]] = {}
+    for item in read_gzip_json(path):
+        key = compact_station_key(item.get("station_name_key") or item.get("station_name") or item.get("api_station_name"))
+        if not key:
+            continue
+        codes = index.setdefault(key, set())
+        for field in ("api_station_code", "station_code", "source_station_code"):
+            code = compact_code(item.get(field))
+            if code:
+                codes.add(code)
+    return index
+
+
+@lru_cache(maxsize=1)
+def subway_congestion_index() -> dict[str, Any]:
+    path = TRANSIT_CONGESTION_GZ / "transit_congestion_subway_summary.json.gz"
+    if not path.exists():
+        return {
+            "available": False,
+            "scenarios": {},
+            "scenario_count": 0,
+        }
+    payload = read_gzip_json(path)
+    scenarios: dict[str, dict[str, Any]] = {}
+    for scenario in payload.get("scenarios") or []:
+        scenario_id = str(scenario.get("scenario_id") or "")
+        if not scenario_id:
+            continue
+        line_scores: dict[str, float] = {}
+        station_scores: dict[str, float] = {}
+        for item in scenario.get("route_congestion") or []:
+            key = compact_code(item.get("id"))
+            line_scores[key] = max(line_scores.get(key, 0.0), safe_float(item.get("congestion_score")))
+        for bucket in ("boarding_stop_congestion", "alighting_stop_congestion"):
+            for item in scenario.get(bucket) or []:
+                key = compact_code(item.get("id"))
+                station_scores[key] = max(station_scores.get(key, 0.0), safe_float(item.get("congestion_score")))
+        scenarios[scenario_id] = {
+            "label": scenario.get("label"),
+            "mode": scenario.get("mode"),
+            "line_scores": line_scores,
+            "station_scores": station_scores,
+        }
+    return {
+        "available": True,
+        "scenarios": scenarios,
+        "scenario_count": len(payload.get("scenarios") or []),
+        "source": str(path.relative_to(ROOT)),
+    }
+
+
+def current_subway_congestion_scenario_id(now: datetime | None = None) -> str | None:
+    seoul_now = now.astimezone(SEOUL_TZ) if now else datetime.now(SEOUL_TZ)
+    weekday = seoul_now.weekday()
+    hour = seoul_now.hour
+    if weekday < 5 and 7 <= hour < 10:
+        return "weekday_morning_subway"
+    if weekday >= 5 and 13 <= hour < 18:
+        return "weekend_afternoon_subway"
+    return None
+
+
+def active_subway_congestion() -> dict[str, Any]:
+    index = subway_congestion_index()
+    scenario_id = current_subway_congestion_scenario_id()
+    scenario = (index.get("scenarios") or {}).get(scenario_id or "")
+    return {
+        "available": bool(index.get("available")),
+        "active_scenario_id": scenario_id,
+        "active_scenario": scenario,
+        "source": index.get("source"),
+        "scenario_count": index.get("scenario_count", 0),
+    }
+
+
+@lru_cache(maxsize=1)
+def subway_accessibility_index() -> dict[str, Any]:
+    roads_path = TRANSPORT_ACCESSIBILITY_GZ / "subway_accessibility_roads.json.gz"
+    districts_path = TRANSPORT_ACCESSIBILITY_GZ / "subway_accessibility_districts.json.gz"
+    if not roads_path.exists():
+        return {"available": False, "road_scores": {}, "district_count": 0, "road_count": 0}
+    roads_payload = read_gzip_json(roads_path)
+    roads = roads_payload.get("roads") or []
+    road_scores = {
+        str(item.get("road_name") or ""): item
+        for item in roads
+        if item.get("road_name")
+    }
+    district_count = 0
+    if districts_path.exists():
+        district_count = len(read_gzip_json(districts_path).get("districts") or [])
+    return {
+        "available": True,
+        "road_scores": road_scores,
+        "road_count": len(roads),
+        "district_count": district_count,
+        "source": str(roads_path.relative_to(ROOT)),
+    }
+
+
+def station_congestion_score(station_name: Any) -> float:
+    congestion = active_subway_congestion()
+    scenario = congestion.get("active_scenario") or {}
+    station_scores: dict[str, float] = scenario.get("station_scores") or {}
+    codes = subway_station_code_index().get(compact_station_key(station_name), set())
+    if not codes:
+        return 0.0
+    return max((station_scores.get(code, 0.0) for code in codes), default=0.0)
+
+
+def line_congestion_score(line_code: Any) -> float:
+    congestion = active_subway_congestion()
+    scenario = congestion.get("active_scenario") or {}
+    line_scores: dict[str, float] = scenario.get("line_scores") or {}
+    key = compact_code(line_code)
+    candidates = [key]
+    if key.isdigit():
+        line_no = int(key)
+        if 5 <= line_no <= 8:
+            candidates.append(str(200 + line_no))
+        elif line_no == 1:
+            candidates.extend(str(100 + offset) for offset in range(1, 15))
+        elif line_no == 3:
+            candidates.extend(str(300 + offset) for offset in range(1, 30))
+        elif line_no == 4:
+            candidates.extend(str(400 + offset) for offset in range(1, 20))
+    return max((line_scores.get(candidate, 0.0) for candidate in candidates), default=0.0)
+
+
+def route_accessibility_context(start: Location, end: Location) -> dict[str, Any]:
+    index = subway_accessibility_index()
+    context = {
+        "available": bool(index.get("available")),
+        "source": index.get("source"),
+        "road_count": index.get("road_count", 0),
+        "district_count": index.get("district_count", 0),
+        "matched_roads": [],
+    }
+    if not index.get("available"):
+        return context
+    label_text = f"{start.label} {end.label}"
+    matched = []
+    for road_name, item in (index.get("road_scores") or {}).items():
+        if road_name and road_name in label_text:
+            matched.append(
+                {
+                    "road_name": road_name,
+                    "cty_nm": item.get("cty_nm"),
+                    "access_score_avg": item.get("access_score_avg"),
+                    "access_dist_avg_m": item.get("access_dist_avg_m"),
+                    "access_dist_min_m": item.get("access_dist_min_m"),
+                }
+            )
+    context["matched_roads"] = sorted(
+        matched,
+        key=lambda item: safe_float(item.get("access_score_avg")),
+        reverse=True,
+    )[:4]
+    return context
 
 
 def representative_line_points(geometry: dict[str, Any]) -> list[list[float]]:
@@ -757,6 +968,55 @@ def fetch_edges(
     return result
 
 
+def subway_step_context(conn: sqlite3.Connection, steps: list[tuple[str, str, str]]) -> dict[str, Any]:
+    edge_ids = [edge_id for edge_id, _, _ in steps if not edge_id.startswith("virtual:")]
+    if not edge_ids:
+        return {
+            "line_codes": [],
+            "line_congestion_score": 0.0,
+            "station_congestion_score": 0.0,
+            "congestion_penalty_multiplier": 0.0,
+        }
+    placeholders = ",".join("?" for _ in edge_ids)
+    rows = conn.execute(
+        f"""
+        SELECT e.edge_id, e.edge_type, e.line_code,
+               nf.station_name AS from_station_name,
+               nt.station_name AS to_station_name
+        FROM edges e
+        LEFT JOIN nodes nf ON nf.node_id = e.from_node_id
+        LEFT JOIN nodes nt ON nt.node_id = e.to_node_id
+        WHERE e.edge_id IN ({placeholders})
+        """,
+        edge_ids,
+    ).fetchall()
+    lines = []
+    station_names = []
+    for _, edge_type, line_code, from_station, to_station in rows:
+        if edge_type == "subway_ride" and line_code:
+            lines.append(str(line_code))
+            if from_station:
+                station_names.append(str(from_station))
+            if to_station:
+                station_names.append(str(to_station))
+    line_scores = [line_congestion_score(line) for line in set(lines)]
+    station_scores = [station_congestion_score(name) for name in set(station_names)]
+    line_score = max(line_scores, default=0.0)
+    station_score = max(station_scores, default=0.0)
+    multiplier = (line_score * SUBWAY_LINE_CONGESTION_WEIGHT) + (station_score * SUBWAY_STATION_CONGESTION_WEIGHT)
+    congestion = active_subway_congestion()
+    return {
+        "line_codes": sorted(set(lines)),
+        "line_congestion_score": round(line_score, 4),
+        "station_congestion_score": round(station_score, 4),
+        "congestion_penalty_multiplier": round(multiplier, 4),
+        "active_scenario_id": congestion.get("active_scenario_id"),
+        "active_scenario_label": (congestion.get("active_scenario") or {}).get("label"),
+        "data_source": congestion.get("source"),
+        "scenario_count": congestion.get("scenario_count", 0),
+    }
+
+
 def summarize_route(features: list[dict[str, Any]], cost: float, start: Location, end: Location) -> dict[str, Any]:
     edge_type_counts: dict[str, int] = {}
     edge_type_lengths: dict[str, float] = {}
@@ -870,6 +1130,7 @@ def summarize_route(features: list[dict[str, Any]], cost: float, start: Location
         "edge_type_lengths_m": edge_type_lengths,
         "dataset_coverage": accessible,
         "route_corridor_context": summarize_route_context(features),
+        "transport_accessibility_context": route_accessibility_context(start, end),
         "subway_lines": sorted(set(subway_lines)),
         "transfer_count": transfer_count,
         "uses_subway": bool(subway_lines),
@@ -971,7 +1232,9 @@ def candidate_subway_route(
             subway_cost, subway_steps = subway_cache[(start_station_id, end_station_id)]
             end_cost, end_steps = end_walk_cache[end_station_id]
             access_penalty = station_access_penalty(start_station["distance_m"]) + station_access_penalty(end_station["distance_m"])
-            total_cost = start_cost + subway_cost + end_cost + access_penalty
+            congestion_context = subway_step_context(conn, subway_steps)
+            congestion_penalty = subway_cost * safe_float(congestion_context.get("congestion_penalty_multiplier"))
+            total_cost = start_cost + subway_cost + end_cost + access_penalty + congestion_penalty
             steps = start_steps + subway_steps + end_steps
             route_info = {
                 "routing_strategy": "candidate_station_subway",
@@ -982,7 +1245,9 @@ def candidate_subway_route(
                     "subway": round(subway_cost, 1),
                     "end_walk": round(end_cost, 1),
                     "station_access_penalty": round(access_penalty, 1),
+                    "subway_congestion_penalty": round(congestion_penalty, 1),
                 },
+                "subway_congestion_context": congestion_context,
             }
             if best is None or total_cost < best[0]:
                 best = (total_cost, steps, route_info)

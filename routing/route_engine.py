@@ -26,20 +26,31 @@ SOURCE_GZ = ROOT / "data_gz" / "source"
 SUBWAY_CATALOG_GZ = SOURCE_GZ / "subway_station_catalog"
 TRANSPORT_ACCESSIBILITY_GZ = SOURCE_GZ / "transport_accessibility_catalog"
 TRANSIT_CONGESTION_GZ = SOURCE_GZ / "transit_congestion_catalog"
+BUS_CATALOG_GZ = SOURCE_GZ / "bus_station_catalog"
 DB_PATH = Path(os.environ.get("IEUM_ROUTE_DB_PATH", str(ROOT / "routing" / "ieum_graph.sqlite"))).expanduser()
 ENV_PATH = ROOT / ".env"
 RESULTS_DIR = ROOT / "routing" / "results"
 TRANSFER_PENALTY = 700.0
+BUS_BOARDING_PENALTY = 180.0
+BUS_TRANSFER_PENALTY = 2600.0
+SAME_STOP_BUS_TRANSFER_PENALTY = 520.0
+INTERMODAL_TRANSFER_PENALTY = 1050.0
 ONE_STATION_WALK_M = 900.0
 LONG_WALK_PENALTY_PER_M = 0.7
 WALK_BUCKET_M = 250.0
 MAX_WALK_BUCKET = 16
-STATION_CANDIDATE_LIMIT = 5
-STATION_CANDIDATE_RADIUS_M = 1800.0
+STATION_CANDIDATE_LIMIT = 3
+STATION_CANDIDATE_RADIUS_M = 1400.0
+BUS_CANDIDATE_LIMIT = 6
+BUS_CANDIDATE_RADIUS_M = 900.0
 DIRECT_WALK_LIMIT_M = 900.0
 EDGE_SNAP_RADIUS_M = 120.0
 SUBWAY_LINE_CONGESTION_WEIGHT = 0.12
 SUBWAY_STATION_CONGESTION_WEIGHT = 0.08
+BUS_ROUTE_CONGESTION_WEIGHT = 0.34
+BUS_STOP_CONGESTION_WEIGHT = 0.10
+BUS_ACCESS_PREFERENCE_RATIO = 1.45
+BUS_ACCESS_ADVANTAGE_M = 700.0
 SEOUL_TZ = timezone(timedelta(hours=9), name="Asia/Seoul")
 try:
     SEOUL_TZ = ZoneInfo("Asia/Seoul")
@@ -52,7 +63,9 @@ WALK_LIKE_EDGE_TYPES = {
     "crosswalk_connector",
     "facility_connector",
     "subway_connector",
+    "bus_connector",
 }
+TRANSIT_RIDE_EDGE_TYPES = {"subway_ride", "bus_ride"}
 ROUTABLE_SNAP_EDGE_TYPES = {
     "walk",
     "braille_walk",
@@ -65,6 +78,11 @@ ROUTABLE_SNAP_EDGE_TYPES = {
 Edge = tuple[str, float, float, str, str, str | None]
 AdjacencyMap = dict[str, list[Edge]]
 VirtualAdjacencyMap = dict[str, tuple[Edge, ...]]
+
+
+def is_excluded_bus_route(route_no: Any) -> bool:
+    route_text = str(route_no or "").strip().upper()
+    return route_text.startswith("N")
 
 
 @dataclass(frozen=True)
@@ -245,9 +263,102 @@ def active_subway_congestion() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
+def bus_congestion_index() -> dict[str, Any]:
+    path = BUS_CATALOG_GZ / "transit_congestion_bus_summary.json.gz"
+    if not path.exists():
+        return {"available": False, "scenarios": {}, "scenario_count": 0}
+    payload = read_gzip_json(path)
+    scenarios: dict[str, dict[str, Any]] = {}
+    for scenario in payload.get("scenarios") or []:
+        scenario_id = str(scenario.get("scenario_id") or "")
+        if not scenario_id:
+            continue
+        scenarios[scenario_id] = {
+            "label": scenario.get("label"),
+            "mode": scenario.get("mode"),
+            "route_scores": {
+                str(item.get("id") or ""): safe_float(item.get("congestion_score"))
+                for item in scenario.get("route_congestion") or []
+                if item.get("id")
+            },
+            "boarding_stop_scores": {
+                str(item.get("id") or ""): safe_float(item.get("congestion_score"))
+                for item in scenario.get("boarding_stop_congestion") or []
+                if item.get("id")
+            },
+            "alighting_stop_scores": {
+                str(item.get("id") or ""): safe_float(item.get("congestion_score"))
+                for item in scenario.get("alighting_stop_congestion") or []
+                if item.get("id")
+            },
+            "route_boarding_scores": {
+                str(item.get("id") or ""): safe_float(item.get("congestion_score"))
+                for item in scenario.get("route_boarding_congestion") or []
+                if item.get("id")
+            },
+            "route_alighting_scores": {
+                str(item.get("id") or ""): safe_float(item.get("congestion_score"))
+                for item in scenario.get("route_alighting_congestion") or []
+                if item.get("id")
+            },
+        }
+    return {
+        "available": True,
+        "scenarios": scenarios,
+        "scenario_count": len(payload.get("scenarios") or []),
+        "source": str(path.relative_to(ROOT)),
+    }
+
+
+def current_bus_congestion_scenario_id(now: datetime | None = None) -> str | None:
+    seoul_now = now.astimezone(SEOUL_TZ) if now else datetime.now(SEOUL_TZ)
+    if seoul_now.weekday() < 5 and 17 <= seoul_now.hour < 20:
+        return "weekday_evening_bus"
+    return None
+
+
+def active_bus_congestion() -> dict[str, Any]:
+    index = bus_congestion_index()
+    scenario_id = current_bus_congestion_scenario_id()
+    scenario = (index.get("scenarios") or {}).get(scenario_id or "")
+    return {
+        "available": bool(index.get("available")),
+        "active_scenario_id": scenario_id,
+        "active_scenario": scenario,
+        "source": index.get("source"),
+        "scenario_count": index.get("scenario_count", 0),
+    }
+
+
+@lru_cache(maxsize=1)
 def subway_accessibility_index() -> dict[str, Any]:
     roads_path = TRANSPORT_ACCESSIBILITY_GZ / "subway_accessibility_roads.json.gz"
     districts_path = TRANSPORT_ACCESSIBILITY_GZ / "subway_accessibility_districts.json.gz"
+    if not roads_path.exists():
+        return {"available": False, "road_scores": {}, "district_count": 0, "road_count": 0}
+    roads_payload = read_gzip_json(roads_path)
+    roads = roads_payload.get("roads") or []
+    road_scores = {
+        str(item.get("road_name") or ""): item
+        for item in roads
+        if item.get("road_name")
+    }
+    district_count = 0
+    if districts_path.exists():
+        district_count = len(read_gzip_json(districts_path).get("districts") or [])
+    return {
+        "available": True,
+        "road_scores": road_scores,
+        "road_count": len(roads),
+        "district_count": district_count,
+        "source": str(roads_path.relative_to(ROOT)),
+    }
+
+
+@lru_cache(maxsize=1)
+def bus_accessibility_index() -> dict[str, Any]:
+    roads_path = BUS_CATALOG_GZ / "bus_accessibility_roads.json.gz"
+    districts_path = BUS_CATALOG_GZ / "bus_accessibility_districts.json.gz"
     if not roads_path.exists():
         return {"available": False, "road_scores": {}, "district_count": 0, "road_count": 0}
     roads_payload = read_gzip_json(roads_path)
@@ -298,8 +409,60 @@ def line_congestion_score(line_code: Any) -> float:
     return max((line_scores.get(candidate, 0.0) for candidate in candidates), default=0.0)
 
 
+def bus_edge_congestion_multiplier(props: dict[str, Any]) -> float:
+    congestion = active_bus_congestion()
+    scenario = congestion.get("active_scenario") or {}
+    if not scenario:
+        return 1.0
+    route_id = str(props.get("route_id") or "")
+    from_stop = str(props.get("from_stop_id") or "")
+    to_stop = str(props.get("to_stop_id") or "")
+    route_score = safe_float((scenario.get("route_scores") or {}).get(route_id))
+    boarding_score = max(
+        safe_float((scenario.get("boarding_stop_scores") or {}).get(from_stop)),
+        safe_float((scenario.get("route_boarding_scores") or {}).get(f"{route_id}|{from_stop}")),
+    )
+    alighting_score = max(
+        safe_float((scenario.get("alighting_stop_scores") or {}).get(to_stop)),
+        safe_float((scenario.get("route_alighting_scores") or {}).get(f"{route_id}|{to_stop}")),
+    )
+    return 1.0 + (route_score * BUS_ROUTE_CONGESTION_WEIGHT) + (max(boarding_score, alighting_score) * BUS_STOP_CONGESTION_WEIGHT)
+
+
 def route_accessibility_context(start: Location, end: Location) -> dict[str, Any]:
     index = subway_accessibility_index()
+    context = {
+        "available": bool(index.get("available")),
+        "source": index.get("source"),
+        "road_count": index.get("road_count", 0),
+        "district_count": index.get("district_count", 0),
+        "matched_roads": [],
+    }
+    if not index.get("available"):
+        return context
+    label_text = f"{start.label} {end.label}"
+    matched = []
+    for road_name, item in (index.get("road_scores") or {}).items():
+        if road_name and road_name in label_text:
+            matched.append(
+                {
+                    "road_name": road_name,
+                    "cty_nm": item.get("cty_nm"),
+                    "access_score_avg": item.get("access_score_avg"),
+                    "access_dist_avg_m": item.get("access_dist_avg_m"),
+                    "access_dist_min_m": item.get("access_dist_min_m"),
+                }
+            )
+    context["matched_roads"] = sorted(
+        matched,
+        key=lambda item: safe_float(item.get("access_score_avg")),
+        reverse=True,
+    )[:4]
+    return context
+
+
+def bus_accessibility_context(start: Location, end: Location) -> dict[str, Any]:
+    index = bus_accessibility_index()
     context = {
         "available": bool(index.get("available")),
         "source": index.get("source"),
@@ -563,16 +726,109 @@ def nearby_subway_stations(
     return sorted(stations, key=lambda station: station["distance_m"])[:limit]
 
 
+def nearby_bus_stops(
+    conn: sqlite3.Connection,
+    lon: float,
+    lat: float,
+    limit: int = BUS_CANDIDATE_LIMIT,
+    radius_m: float = BUS_CANDIDATE_RADIUS_M,
+) -> list[dict[str, Any]]:
+    radius_deg = radius_m / 111000
+    rows = conn.execute(
+        """
+        SELECT node_id, node_type, lon, lat, station_name, raw_properties,
+               ((lon - ?) * (lon - ?) + (lat - ?) * (lat - ?)) AS d2
+        FROM nodes
+        WHERE node_type = 'bus_stop'
+          AND lon BETWEEN ? AND ?
+          AND lat BETWEEN ? AND ?
+        ORDER BY d2
+        LIMIT ?
+        """,
+        (
+            lon,
+            lon,
+            lat,
+            lat,
+            lon - radius_deg,
+            lon + radius_deg,
+            lat - radius_deg,
+            lat + radius_deg,
+            limit * 5,
+        ),
+    ).fetchall()
+    stops = []
+    for row in rows:
+        props = json.loads(row[5] or "{}")
+        distance = haversine_m((lon, lat), (row[2], row[3]))
+        if distance > radius_m:
+            continue
+        stops.append(
+            {
+                "node_id": row[0],
+                "node_type": row[1],
+                "lon": row[2],
+                "lat": row[3],
+                "station_name": row[4],
+                "seoul_ars_id": props.get("seoul_ars_id"),
+                "distance_m": distance,
+            }
+        )
+    return sorted(stops, key=lambda stop: stop["distance_m"])[:limit]
+
+
 def load_adjacency(conn: sqlite3.Connection) -> AdjacencyMap:
     adjacency: AdjacencyMap = {}
-    for edge_id, from_id, to_id, weight, length_m, edge_type, line_code in conn.execute(
-        "SELECT edge_id, from_node_id, to_node_id, visual_impairment_weight, length_m, edge_type, line_code FROM edges"
+    for edge_id, from_id, to_id, weight, length_m, edge_type, line_code, raw_properties in conn.execute(
+        "SELECT edge_id, from_node_id, to_node_id, visual_impairment_weight, length_m, edge_type, line_code, raw_properties FROM edges"
     ):
+        try:
+            props = json.loads(raw_properties or "{}")
+        except json.JSONDecodeError:
+            props = {}
         cost = float(weight)
         length = float(length_m or 0)
-        adjacency.setdefault(from_id, []).append((to_id, cost, length, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
-        adjacency.setdefault(to_id, []).append((from_id, cost, length, edge_id, str(edge_type or ""), str(line_code) if line_code else None))
+        edge_type_text = str(edge_type or "")
+        line_code_text = str(line_code) if line_code else None
+        if edge_type_text == "bus_ride" and (
+            is_excluded_bus_route(props.get("route_no"))
+            or is_excluded_bus_route(props.get("route_name"))
+            or is_excluded_bus_route(str(line_code_text or "").replace("bus:", "", 1))
+        ):
+            continue
+        if edge_type_text == "bus_ride":
+            cost *= bus_edge_congestion_multiplier(props)
+        is_directed = bool(props.get("is_directed"))
+        adjacency.setdefault(from_id, []).append((to_id, cost, length, edge_id, edge_type_text, line_code_text))
+        if not is_directed:
+            adjacency.setdefault(to_id, []).append((from_id, cost, length, edge_id, edge_type_text, line_code_text))
     return adjacency
+
+
+def transit_mode(line_code: str | None, edge_type: str | None = None) -> str | None:
+    if edge_type == "bus_ride" or str(line_code or "").startswith("bus:"):
+        return "bus"
+    if edge_type == "subway_ride" or line_code:
+        return "subway"
+    return None
+
+
+def transfer_penalty(current_line: str | None, next_line: str | None, edge_type: str, current_walk_bucket: int = 0) -> float:
+    if edge_type not in TRANSIT_RIDE_EDGE_TYPES or not next_line:
+        return 0.0
+    if not current_line:
+        return BUS_BOARDING_PENALTY if transit_mode(next_line, edge_type) == "bus" else 0.0
+    if current_line == next_line:
+        return 0.0
+    current_mode = transit_mode(current_line)
+    next_mode = transit_mode(next_line, edge_type)
+    if current_mode == "bus" and next_mode == "bus":
+        if current_walk_bucket == 0:
+            return SAME_STOP_BUS_TRANSFER_PENALTY
+        return BUS_TRANSFER_PENALTY
+    if current_mode and next_mode and current_mode != next_mode:
+        return INTERMODAL_TRANSFER_PENALTY
+    return TRANSFER_PENALTY
 
 
 def iter_neighbors(
@@ -789,6 +1045,30 @@ def add_virtual_snap_node(
     }
 
 
+def corridor_allowed_nodes(
+    conn: sqlite3.Connection,
+    start: Location,
+    end: Location,
+    margin_m: float = 3500.0,
+) -> set[str]:
+    direct_m = haversine_m((start.lon, start.lat), (end.lon, end.lat))
+    margin_deg = max(margin_m, min(9000.0, direct_m * 0.35)) / 111000
+    min_lon = min(start.lon, end.lon) - margin_deg
+    max_lon = max(start.lon, end.lon) + margin_deg
+    min_lat = min(start.lat, end.lat) - margin_deg
+    max_lat = max(start.lat, end.lat) + margin_deg
+    rows = conn.execute(
+        """
+        SELECT node_id
+        FROM nodes
+        WHERE lon BETWEEN ? AND ?
+          AND lat BETWEEN ? AND ?
+        """,
+        (min_lon, max_lon, min_lat, max_lat),
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def walk_bucket(walk_m: float) -> int:
     return min(int(math.ceil(walk_m / WALK_BUCKET_M)), MAX_WALK_BUCKET)
 
@@ -803,12 +1083,58 @@ def station_access_penalty(distance_m: float) -> float:
     return max(0.0, distance_m - ONE_STATION_WALK_M) * LONG_WALK_PENALTY_PER_M
 
 
+def candidate_access_cost(route_info: dict[str, Any]) -> float:
+    breakdown = route_info.get("cost_breakdown") or {}
+    return (
+        safe_float(breakdown.get("start_walk"))
+        + safe_float(breakdown.get("end_walk"))
+        + safe_float(breakdown.get("station_access_penalty"))
+        + safe_float(breakdown.get("bus_access_penalty"))
+    )
+
+
+def choose_transit_candidate(
+    station_route: tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None,
+    bus_route: tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None,
+) -> tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None:
+    if station_route is None:
+        return bus_route
+    if bus_route is None:
+        return station_route
+
+    station_cost, _, station_info = station_route
+    bus_cost, _, bus_info = bus_route
+    if bus_cost <= station_cost:
+        bus_info["candidate_selection_reason"] = "bus_lower_cost"
+        return bus_route
+
+    station_access = candidate_access_cost(station_info)
+    bus_access = candidate_access_cost(bus_info)
+    if (
+        int(bus_info.get("bus_route_count") or 0) <= 1
+        and bus_cost <= station_cost * BUS_ACCESS_PREFERENCE_RATIO
+        and bus_access + BUS_ACCESS_ADVANTAGE_M <= station_access
+    ):
+        bus_info["candidate_selection_reason"] = "bus_access_advantage"
+        bus_info["compared_subway_cost"] = round(station_cost, 1)
+        bus_info["compared_subway_access_cost"] = round(station_access, 1)
+        bus_info["bus_access_cost"] = round(bus_access, 1)
+        return bus_route
+
+    station_info["candidate_selection_reason"] = "subway_lower_cost"
+    station_info["compared_bus_cost"] = round(bus_cost, 1)
+    station_info["compared_bus_access_cost"] = round(bus_access, 1)
+    station_info["subway_access_cost"] = round(station_access, 1)
+    return station_route
+
+
 def dijkstra(
     adjacency: AdjacencyMap,
     start_id: str,
     goal_id: str,
     max_visited: int = 2000000,
     allowed_edge_types: set[str] | None = None,
+    allowed_nodes: set[str] | None = None,
     apply_long_walk_penalty: bool = True,
     apply_transfer_penalty: bool = True,
     virtual_adjacency: VirtualAdjacencyMap | None = None,
@@ -838,11 +1164,13 @@ def dijkstra(
         ):
             if allowed_edge_types is not None and edge_type not in allowed_edge_types:
                 continue
-            next_line = line_code if edge_type == "subway_ride" else current_line
+            if allowed_nodes is not None and next_id not in allowed_nodes and not next_id.startswith("virtual:"):
+                continue
+            next_line = line_code if edge_type in TRANSIT_RIDE_EDGE_TYPES else current_line
             if not apply_long_walk_penalty:
                 next_walk_m = 0.0
                 next_walk_bucket = 0
-            elif edge_type == "subway_ride":
+            elif edge_type in TRANSIT_RIDE_EDGE_TYPES:
                 next_walk_m = 0.0
                 next_walk_bucket = 0
             elif edge_type in WALK_LIKE_EDGE_TYPES:
@@ -853,8 +1181,8 @@ def dijkstra(
                 next_walk_m = current_walk_m
                 next_walk_bucket = current_walk_bucket
             transfer_cost = (
-                TRANSFER_PENALTY
-                if apply_transfer_penalty and edge_type == "subway_ride" and current_line and line_code and current_line != line_code
+                transfer_penalty(current_line, line_code, edge_type, current_walk_bucket)
+                if apply_transfer_penalty
                 else 0.0
             )
             walk_penalty = (
@@ -958,6 +1286,15 @@ def fetch_edges(
         geometry = json.loads(row[8])
         if row[3] == route_to and row[4] == route_from and geometry.get("type") == "LineString":
             geometry["coordinates"] = list(reversed(geometry.get("coordinates") or []))
+        if props["edge_type"] == "bus_ride" and geometry.get("type") == "LineString":
+            coords = geometry.get("coordinates") or []
+            from_node = props.get("route_from_node") or {}
+            to_node = props.get("route_to_node") or {}
+            if len(coords) >= 2 and from_node.get("lon") is not None and from_node.get("lat") is not None:
+                coords[0] = [float(from_node["lon"]), float(from_node["lat"])]
+            if len(coords) >= 2 and to_node.get("lon") is not None and to_node.get("lat") is not None:
+                coords[-1] = [float(to_node["lon"]), float(to_node["lat"])]
+            geometry["coordinates"] = coords
         result.append(
             {
                 "type": "Feature",
@@ -966,6 +1303,36 @@ def fetch_edges(
             }
         )
     return result
+
+
+def transit_lines_for_steps(conn: sqlite3.Connection, steps: list[tuple[str, str, str]], edge_type: str) -> list[str]:
+    edge_ids = [edge_id for edge_id, _, _ in steps if not edge_id.startswith("virtual:")]
+    if not edge_ids:
+        return []
+    placeholders = ",".join("?" for _ in edge_ids)
+    rows = conn.execute(
+        f"SELECT edge_id, line_code, raw_properties FROM edges WHERE edge_id IN ({placeholders})",
+        edge_ids,
+    ).fetchall()
+    by_id = {row[0]: row for row in rows}
+    lines: list[str] = []
+    for edge_id in edge_ids:
+        row = by_id.get(edge_id)
+        if not row:
+            continue
+        try:
+            props = json.loads(row[2] or "{}")
+        except json.JSONDecodeError:
+            props = {}
+        if props.get("edge_type") != edge_type:
+            continue
+        line = props.get("route_no") or props.get("route_name") or row[1]
+        if not line:
+            continue
+        line_text = str(line).replace("bus:", "", 1)
+        if not lines or lines[-1] != line_text:
+            lines.append(line_text)
+    return lines
 
 
 def subway_step_context(conn: sqlite3.Connection, steps: list[tuple[str, str, str]]) -> dict[str, Any]:
@@ -1021,8 +1388,11 @@ def summarize_route(features: list[dict[str, Any]], cost: float, start: Location
     edge_type_counts: dict[str, int] = {}
     edge_type_lengths: dict[str, float] = {}
     subway_lines: list[str] = []
+    bus_routes: list[str] = []
     last_subway_line: str | None = None
+    last_bus_route: str | None = None
     transfer_count = 0
+    bus_transfer_count = 0
     total_length = 0.0
     accessible = {
         "braille_edge_count": 0,
@@ -1045,6 +1415,10 @@ def summarize_route(features: list[dict[str, Any]], cost: float, start: Location
         "subway_ride_length_m": 0.0,
         "subway_connector_count": 0,
         "subway_connector_length_m": 0.0,
+        "bus_ride_count": 0,
+        "bus_ride_length_m": 0.0,
+        "bus_connector_count": 0,
+        "bus_connector_length_m": 0.0,
         "walk_count": 0,
         "walk_length_m": 0.0,
         "low_confidence_count": 0,
@@ -1066,6 +1440,13 @@ def summarize_route(features: list[dict[str, Any]], cost: float, start: Location
             if last_subway_line and last_subway_line != line_code:
                 transfer_count += 1
             last_subway_line = line_code
+        if edge_type == "bus_ride":
+            route_no = str(props.get("route_no") or props.get("route_name") or props.get("line_code") or "")
+            if route_no:
+                bus_routes.append(route_no)
+                if last_bus_route and last_bus_route != route_no:
+                    bus_transfer_count += 1
+                last_bus_route = route_no
         if edge_type in {"walk", "braille_walk"}:
             accessible["walk_count"] += 1
             accessible["walk_length_m"] += length_m
@@ -1099,6 +1480,12 @@ def summarize_route(features: list[dict[str, Any]], cost: float, start: Location
         if edge_type == "subway_connector":
             accessible["subway_connector_count"] += 1
             accessible["subway_connector_length_m"] += length_m
+        if edge_type == "bus_ride":
+            accessible["bus_ride_count"] += 1
+            accessible["bus_ride_length_m"] += length_m
+        if edge_type == "bus_connector":
+            accessible["bus_connector_count"] += 1
+            accessible["bus_connector_length_m"] += length_m
         if edge_type in {"route_start_connector", "route_end_connector"}:
             accessible["walk_count"] += 1
             accessible["walk_length_m"] += length_m
@@ -1131,9 +1518,18 @@ def summarize_route(features: list[dict[str, Any]], cost: float, start: Location
         "dataset_coverage": accessible,
         "route_corridor_context": summarize_route_context(features),
         "transport_accessibility_context": route_accessibility_context(start, end),
+        "bus_accessibility_context": bus_accessibility_context(start, end),
+        "bus_congestion_context": {
+            key: value
+            for key, value in active_bus_congestion().items()
+            if key != "active_scenario"
+        },
         "subway_lines": sorted(set(subway_lines)),
+        "bus_routes": sorted(set(bus_routes)),
         "transfer_count": transfer_count,
+        "bus_transfer_count": bus_transfer_count,
         "uses_subway": bool(subway_lines),
+        "uses_bus": bool(bus_routes),
     }
 
 
@@ -1169,6 +1565,7 @@ def candidate_subway_route(
     end: Location,
     start_node: dict[str, Any],
     end_node: dict[str, Any],
+    allowed_nodes: set[str] | None = None,
     virtual_adjacency: VirtualAdjacencyMap | None = None,
 ) -> tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None:
     start_stations = nearby_subway_stations(conn, start.lon, start.lat)
@@ -1192,6 +1589,7 @@ def candidate_subway_route(
                 start_node["node_id"],
                 start_station_id,
                 allowed_edge_types=walk_edge_types,
+                allowed_nodes=allowed_nodes,
                 apply_long_walk_penalty=False,
                 apply_transfer_penalty=False,
                 virtual_adjacency=virtual_adjacency,
@@ -1210,6 +1608,7 @@ def candidate_subway_route(
                         end_station_id,
                         end_node["node_id"],
                         allowed_edge_types=walk_edge_types,
+                        allowed_nodes=allowed_nodes,
                         apply_long_walk_penalty=False,
                         apply_transfer_penalty=False,
                         virtual_adjacency=virtual_adjacency,
@@ -1255,6 +1654,109 @@ def candidate_subway_route(
     return best
 
 
+def candidate_bus_route(
+    conn: sqlite3.Connection,
+    adjacency: AdjacencyMap,
+    start: Location,
+    end: Location,
+    start_node: dict[str, Any],
+    end_node: dict[str, Any],
+    allowed_nodes: set[str] | None = None,
+    virtual_adjacency: VirtualAdjacencyMap | None = None,
+) -> tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None:
+    start_stops = nearby_bus_stops(conn, start.lon, start.lat)
+    end_stops = nearby_bus_stops(conn, end.lon, end.lat)
+    if not start_stops or not end_stops:
+        return None
+
+    best: tuple[float, list[tuple[str, str, str]], dict[str, Any]] | None = None
+    walk_edge_types = set(WALK_LIKE_EDGE_TYPES)
+    bus_edge_types = {"bus_ride"}
+    start_walk_cache: dict[str, tuple[float, list[tuple[str, str, str]]]] = {}
+    end_walk_cache: dict[str, tuple[float, list[tuple[str, str, str]]]] = {}
+    bus_cache: dict[tuple[str, str], tuple[float, list[tuple[str, str, str]]]] = {}
+
+    for start_stop in start_stops:
+        start_stop_id = start_stop["node_id"]
+        try:
+            start_walk_cache[start_stop_id] = dijkstra(
+                adjacency,
+                start_node["node_id"],
+                start_stop_id,
+                allowed_edge_types=walk_edge_types,
+                allowed_nodes=allowed_nodes,
+                apply_long_walk_penalty=False,
+                apply_transfer_penalty=False,
+                virtual_adjacency=virtual_adjacency,
+                max_visited=350000,
+            )
+        except RuntimeError:
+            continue
+
+        for end_stop in end_stops:
+            end_stop_id = end_stop["node_id"]
+            if start_stop_id == end_stop_id:
+                continue
+            try:
+                if end_stop_id not in end_walk_cache:
+                    end_walk_cache[end_stop_id] = dijkstra(
+                        adjacency,
+                        end_stop_id,
+                        end_node["node_id"],
+                        allowed_edge_types=walk_edge_types,
+                        allowed_nodes=allowed_nodes,
+                        apply_long_walk_penalty=False,
+                        apply_transfer_penalty=False,
+                        virtual_adjacency=virtual_adjacency,
+                        max_visited=350000,
+                    )
+                bus_key = (start_stop_id, end_stop_id)
+                if bus_key not in bus_cache:
+                    bus_cache[bus_key] = dijkstra(
+                        adjacency,
+                        start_stop_id,
+                        end_stop_id,
+                        allowed_edge_types=bus_edge_types,
+                        allowed_nodes=allowed_nodes,
+                        apply_long_walk_penalty=False,
+                        apply_transfer_penalty=True,
+                        virtual_adjacency=virtual_adjacency,
+                        max_visited=350000,
+                    )
+            except RuntimeError:
+                continue
+
+            start_cost, start_steps = start_walk_cache[start_stop_id]
+            bus_cost, bus_steps = bus_cache[(start_stop_id, end_stop_id)]
+            end_cost, end_steps = end_walk_cache[end_stop_id]
+            access_penalty = station_access_penalty(start_stop["distance_m"]) + station_access_penalty(end_stop["distance_m"])
+            total_cost = start_cost + bus_cost + end_cost + access_penalty
+            steps = start_steps + bus_steps + end_steps
+            bus_route_sequence = transit_lines_for_steps(conn, bus_steps, "bus_ride")
+            route_info = {
+                "routing_strategy": "candidate_bus",
+                "start_bus_stop": start_stop,
+                "end_bus_stop": end_stop,
+                "bus_route_sequence": bus_route_sequence,
+                "bus_route_count": len(bus_route_sequence),
+                "same_stop_bus_transfer_count": max(0, len(bus_route_sequence) - 1),
+                "cost_breakdown": {
+                    "start_walk": round(start_cost, 1),
+                    "bus": round(bus_cost, 1),
+                    "end_walk": round(end_cost, 1),
+                    "bus_access_penalty": round(access_penalty, 1),
+                },
+                "bus_congestion_context": {
+                    key: value
+                    for key, value in active_bus_congestion().items()
+                    if key != "active_scenario"
+                },
+            }
+            if best is None or total_cost < best[0]:
+                best = (total_cost, steps, route_info)
+    return best
+
+
 def build_route_geojson(
     conn: sqlite3.Connection,
     start_query: str,
@@ -1270,6 +1772,12 @@ def build_route_geojson(
     end_node = add_virtual_snap_node(virtual_overlay, virtual_edges, conn, end, "end")
     virtual_adjacency: VirtualAdjacencyMap = {node_id: tuple(edges) for node_id, edges in virtual_overlay.items()}
     direct_distance_m = haversine_m((start.lon, start.lat), (end.lon, end.lat))
+    allowed_nodes = corridor_allowed_nodes(conn, start, end)
+    allowed_nodes.update(
+        node["node_id"]
+        for node in (start_node, end_node)
+        if node.get("node_id") and not str(node.get("node_id")).startswith("virtual:")
+    )
     route_info: dict[str, Any] = {"routing_strategy": "single_graph"}
     if direct_distance_m <= DIRECT_WALK_LIMIT_M:
         cost, steps = dijkstra(
@@ -1277,6 +1785,7 @@ def build_route_geojson(
             start_node["node_id"],
             end_node["node_id"],
             allowed_edge_types=set(WALK_LIKE_EDGE_TYPES),
+            allowed_nodes=allowed_nodes,
             apply_long_walk_penalty=False,
             apply_transfer_penalty=False,
             virtual_adjacency=virtual_adjacency,
@@ -1290,17 +1799,35 @@ def build_route_geojson(
             end,
             start_node,
             end_node,
+            allowed_nodes=allowed_nodes,
             virtual_adjacency=virtual_adjacency,
         )
-        if station_route:
-            cost, steps, route_info = station_route
+        bus_route = candidate_bus_route(
+            conn,
+            base_graph,
+            start,
+            end,
+            start_node,
+            end_node,
+            allowed_nodes=allowed_nodes,
+            virtual_adjacency=virtual_adjacency,
+        )
+        transit_candidate = choose_transit_candidate(station_route, bus_route)
+        if transit_candidate:
+            cost, steps, route_info = transit_candidate
         else:
             cost, steps = dijkstra(
                 base_graph,
                 start_node["node_id"],
                 end_node["node_id"],
+                allowed_nodes=allowed_nodes,
                 virtual_adjacency=virtual_adjacency,
+                max_visited=600000,
             )
+            route_info = {
+                "routing_strategy": "single_graph_multimodal_fallback",
+                "cost_breakdown": {"graph": round(cost, 1)},
+            }
     features = fetch_edges(conn, steps, virtual_edges)
     summary = summarize_route(features, cost, start, end)
     summary["start_snap_node"] = start_node

@@ -14,6 +14,7 @@ OUT_DATA = OUT / "data"
 
 NAV_DATA = ROOT / "nav_map" / "web" / "data"
 SUBWAY_DATA = ROOT / "subway_station_catalog" / "web" / "data"
+BUS_DATA = ROOT / "bus_station_catalog" / "web" / "data"
 
 
 def read_geojson(path: Path) -> dict[str, Any]:
@@ -130,6 +131,69 @@ def as_linestring_coords(geometry: dict[str, Any]) -> list[list[float]]:
     return coords
 
 
+def nearest_point_on_polyline(coord: list[float], line: list[list[float]]) -> tuple[list[float], int, float, float]:
+    best_point = line[0]
+    best_segment = 0
+    best_distance = float("inf")
+    best_along = 0.0
+    along = 0.0
+    lon, lat = coord
+    scale = math.cos(math.radians(lat))
+    px = lon * scale
+    py = lat
+    for idx, (left, right) in enumerate(zip(line, line[1:])):
+        lon1, lat1 = left
+        lon2, lat2 = right
+        ax = lon1 * scale
+        ay = lat1
+        bx = lon2 * scale
+        by = lat2
+        dx = bx - ax
+        dy = by - ay
+        denom = dx * dx + dy * dy
+        if denom == 0:
+            projected = left
+            t = 0.0
+        else:
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+            projected = [lon1 + (lon2 - lon1) * t, lat1 + (lat2 - lat1) * t]
+        distance = haversine_m(coord, projected)
+        if distance < best_distance:
+            best_point = projected
+            best_segment = idx
+            best_distance = distance
+            best_along = along + haversine_m(left, projected)
+        along += haversine_m(left, right)
+    return best_point, best_segment, best_distance, best_along
+
+
+def slice_polyline_between(line: list[list[float]], start: list[float], end: list[float]) -> list[list[float]]:
+    if len(line) < 2:
+        return [start, end]
+    start_point, start_segment, start_distance, start_along = nearest_point_on_polyline(start, line)
+    end_point, end_segment, end_distance, end_along = nearest_point_on_polyline(end, line)
+    if start_distance > 80 or end_distance > 80 or end_along <= start_along:
+        return [start, end]
+    coords = [start_point]
+    if end_segment > start_segment:
+        coords.extend(line[start_segment + 1 : end_segment + 1])
+    coords.append(end_point)
+    deduped = []
+    for coord in coords:
+        if not deduped or coord != deduped[-1]:
+            deduped.append(coord)
+    return deduped if len(deduped) >= 2 else [start, end]
+
+
+def bus_stop_node_id(value: Any) -> str:
+    return f"bus_stop:{str(value or '').strip()}"
+
+
+def is_excluded_bus_route(route_no: Any) -> bool:
+    route_text = str(route_no or "").strip().upper()
+    return route_text.startswith("N")
+
+
 def visual_weight(base_m: float, flags: dict[str, Any]) -> float:
     weight = base_m
     if flags.get("has_braille"):
@@ -144,6 +208,8 @@ def visual_weight(base_m: float, flags: dict[str, Any]) -> float:
         weight *= 0.85
     if flags.get("is_subway_ride"):
         weight *= 0.50
+    if flags.get("is_bus_ride"):
+        weight *= 0.38
     if flags.get("data_confidence") == "low":
         weight *= 1.25
     return round(weight, 3)
@@ -161,6 +227,8 @@ def main() -> int:
     nav_subway_elevators = read_geojson(NAV_DATA / "subway_elevators.geojson")["features"]
     subway_points = read_geojson(SUBWAY_DATA / "merged_station_points.geojson")["features"]
     subway_segments = read_geojson(SUBWAY_DATA / "line_segments_display.geojson")["features"]
+    bus_catalog = json.loads((BUS_DATA / "merged_bus_stop_catalog.json").read_text(encoding="utf-8"))
+    bus_route_segments = read_geojson(BUS_DATA / "bus_route_segments.geojson")["features"]
 
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -183,6 +251,7 @@ def main() -> int:
             "is_crosswalk": props.get("edge_type") == "crosswalk",
             "is_subway_internal": props.get("edge_type") == "subway_connector",
             "is_subway_ride": props.get("edge_type") == "subway_ride",
+            "is_bus_ride": props.get("edge_type") == "bus_ride",
             "data_confidence": props.get("data_confidence"),
         }
         edges.append(
@@ -475,6 +544,111 @@ def main() -> int:
             },
         )
 
+    bus_shape_by_route: dict[str, list[list[float]]] = {}
+    for feature in bus_route_segments:
+        props = feature.get("properties") or {}
+        seoul_route_id = str(props.get("seoul_route_id") or "").strip()
+        coords = as_linestring_coords(feature.get("geometry") or {})
+        if seoul_route_id and len(coords) >= 2:
+            bus_shape_by_route[seoul_route_id] = coords
+
+    bus_links_by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    bus_stop_props: dict[str, dict[str, Any]] = {}
+    for link in bus_catalog.get("route_stop_links") or []:
+        seoul_station_id = str(link.get("seoul_station_id") or link.get("seoul_node_id") or link.get("stop_id") or "").strip()
+        lat = link.get("api_lat") if link.get("api_lat") is not None else link.get("lat")
+        lon = link.get("api_lon") if link.get("api_lon") is not None else link.get("lon")
+        if not seoul_station_id or lat is None or lon is None:
+            continue
+        route_id = str(link.get("route_id") or "").strip()
+        if not route_id:
+            continue
+        bus_links_by_route[route_id].append(link)
+        bus_stop_props.setdefault(
+            seoul_station_id,
+            {
+                "node_type": "bus_stop",
+                "source": "bus_station_catalog.merged_bus_stop_catalog",
+                "station_name": link.get("stop_name"),
+                "stop_name": link.get("stop_name"),
+                "seoul_station_id": seoul_station_id,
+                "seoul_ars_id": link.get("seoul_api_ars_id") or link.get("seoul_ars_id"),
+                "lat": float(lat),
+                "lon": float(lon),
+            },
+        )
+
+    for seoul_station_id, props in bus_stop_props.items():
+        coord = [props.pop("lon"), props.pop("lat")]
+        node_id = bus_stop_node_id(seoul_station_id)
+        add_node(node_id, coord, props)
+        nearest = walk_route_index.nearest(coord, max_radius_m=90)
+        if nearest:
+            add_edge(
+                f"connector:bus_walk:{seoul_station_id}",
+                node_id,
+                nearest[0],
+                [coord, nearest[1]],
+                {
+                    "edge_type": "bus_connector",
+                    "source": "generated.nearest_walk_geometry_endpoint",
+                    "length_m": nearest[2],
+                    "data_confidence": "medium" if nearest[2] <= 60 else "low",
+                },
+            )
+
+    for route_id, links in bus_links_by_route.items():
+        links.sort(key=lambda item: (item.get("sequence") or item.get("seoul_api_sequence") or 0, str(item.get("stop_id") or "")))
+        route_no = next((link.get("route_no") for link in links if link.get("route_no")), route_id)
+        if is_excluded_bus_route(route_no):
+            continue
+        for idx, (left, right) in enumerate(zip(links, links[1:]), start=1):
+            left_station = str(left.get("seoul_station_id") or left.get("seoul_node_id") or left.get("stop_id") or "").strip()
+            right_station = str(right.get("seoul_station_id") or right.get("seoul_node_id") or right.get("stop_id") or "").strip()
+            if not left_station or not right_station or left_station == right_station:
+                continue
+            left_coord = [
+                float(left.get("api_lon") if left.get("api_lon") is not None else left.get("lon")),
+                float(left.get("api_lat") if left.get("api_lat") is not None else left.get("lat")),
+            ]
+            right_coord = [
+                float(right.get("api_lon") if right.get("api_lon") is not None else right.get("lon")),
+                float(right.get("api_lat") if right.get("api_lat") is not None else right.get("lat")),
+            ]
+            seoul_route_id = str(left.get("seoul_route_id") or right.get("seoul_route_id") or "").strip()
+            shape = bus_shape_by_route.get(seoul_route_id)
+            coords = slice_polyline_between(shape, left_coord, right_coord) if shape else [left_coord, right_coord]
+            direction_name = left.get("direction_name") or right.get("direction_name")
+            add_edge(
+                f"bus_ride:{route_id}:{left.get('sequence')}:{right.get('sequence')}:{idx}",
+                bus_stop_node_id(left_station),
+                bus_stop_node_id(right_station),
+                coords,
+                {
+                    "edge_type": "bus_ride",
+                    "source": "bus_station_catalog.route_stop_links",
+                    "is_directed": True,
+                    "line_code": f"bus:{left.get('route_no') or left.get('route_name') or route_id}",
+                    "route_id": route_id,
+                    "seoul_route_id": seoul_route_id,
+                    "route_no": left.get("route_no"),
+                    "route_name": left.get("route_name"),
+                    "direction": left.get("direction") or right.get("direction"),
+                    "direction_name": direction_name,
+                    "from_stop_id": left_station,
+                    "from_stop_name": left.get("stop_name"),
+                    "from_ars_id": left.get("seoul_api_ars_id") or left.get("seoul_ars_id"),
+                    "from_sequence": left.get("sequence"),
+                    "to_stop_id": right_station,
+                    "to_stop_name": right.get("stop_name"),
+                    "to_ars_id": right.get("seoul_api_ars_id") or right.get("seoul_ars_id"),
+                    "to_sequence": right.get("sequence"),
+                    "section_id": right.get("section_id") or left.get("section_id"),
+                    "section_distance_m": right.get("section_distance_m") or left.get("section_distance_m"),
+                    "data_confidence": "high" if direction_name else "medium",
+                },
+            )
+
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "node_count": len(nodes),
@@ -484,6 +658,7 @@ def main() -> int:
         "sources": {
             "nav_map": str(NAV_DATA),
             "subway_station_catalog": str(SUBWAY_DATA),
+            "bus_station_catalog": str(BUS_DATA),
         },
     }
 

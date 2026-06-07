@@ -599,6 +599,16 @@ def subway_segment(group: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def bus_stop_name_from_props(props: dict[str, Any], endpoint: str) -> str:
+    key = f"{endpoint}_stop_name"
+    if props.get(key):
+        return str(props[key])
+    node = props.get(f"route_{endpoint}_node") or {}
+    if isinstance(node, dict) and node.get("station_name"):
+        return str(node["station_name"])
+    return ""
+
+
 def nearest_subway_segment(groups: list[list[dict[str, Any]]], start_index: int, step: int) -> dict[str, Any] | None:
     index = start_index
     while 0 <= index < len(groups):
@@ -817,7 +827,46 @@ def generate_instructions(route_geojson: dict[str, Any]) -> list[dict[str, Any]]
             inside_station = True
             continue
 
-        if edge_type == "crosswalk_connector":
+        if edge_type == "bus_ride":
+            route_no = str(first_props.get("route_no") or first_props.get("route_name") or "버스")
+            direction_name = str(first_props.get("direction_name") or first_props.get("direction") or "").strip()
+            if direction_name and not direction_name.endswith("방면"):
+                direction_name = f"{direction_name} 방면"
+            from_name = bus_stop_name_from_props(first_props, "from")
+            to_name = bus_stop_name_from_props(last_props, "to")
+            direction_part = f" {direction_name}" if direction_name else ""
+            stop_count = len(group)
+            instructions.append(
+                instruction(
+                    "bus_ride",
+                    f"{route_no}번{direction_part} 버스를 타고 {from_name} 정류장에서 {to_name} 정류장까지 "
+                    f"{stop_count}개 정류장 이동하세요. 하차 정류장에 가까워지면 정류장 안내 방송과 주변 소리를 확인하세요.",
+                    line_code=route_no,
+                    from_station=from_name,
+                    to_station=to_name,
+                    station_name=to_name,
+                    segment_count=stop_count,
+                    distance_m=dist,
+                    direction=direction_name or None,
+                )
+            )
+            continue
+
+        if edge_type == "bus_connector":
+            stop_name = (
+                station_name_from_node(first_props.get("route_to_node"), first_props.get("route_to_node_id"))
+                or station_name_from_node(first_props.get("route_from_node"), first_props.get("route_from_node_id"))
+            )
+            stop_part = f"{stop_name} 정류장 쪽으로" if stop_name else "가까운 버스 정류장 쪽으로"
+            instructions.append(
+                instruction(
+                    "move",
+                    f"{stop_part} {spoken_dist}미터 이동하세요. 정류장에 도착하면 안내 방송과 주변 대기 위치를 확인하세요.",
+                    distance_m=dist,
+                    station_name=stop_name or None,
+                )
+            )
+        elif edge_type == "crosswalk_connector":
             instructions.append(instruction("move", f"횡단보도 접근 연결부를 {spoken_dist}미터 이동하세요.", distance_m=dist))
         else:
             instructions.append(instruction("move", f"{edge_type} 구간을 {spoken_dist}미터 이동하세요.", distance_m=dist))

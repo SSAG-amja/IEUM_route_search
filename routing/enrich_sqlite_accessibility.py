@@ -125,6 +125,8 @@ def accessibility_weight(
     weight = length_m
     if edge_type == "subway_ride":
         weight *= 0.50
+    elif edge_type == "bus_ride":
+        weight *= 0.38
     elif edge_type == "subway_connector":
         if has_elevator:
             weight *= 0.20
@@ -136,6 +138,13 @@ def accessibility_weight(
             weight *= 0.85
     elif edge_type == "facility_connector" and has_elevator:
         weight *= 0.30
+    elif edge_type == "bus_connector":
+        if length_m <= 25:
+            weight *= 0.85
+        elif length_m <= 60:
+            weight *= 1.05
+        else:
+            weight = weight * 1.35 + 80.0
     elif edge_type == "braille_walk" or has_braille or near_braille_count:
         weight *= 0.68
     elif edge_type == "walk" and near_audible_signal_count:
@@ -153,6 +162,10 @@ def accessibility_weight(
 
     if edge_type == "walk" and near_crosswalk_count and not near_audible_signal_count:
         weight *= 1.08
+    if edge_type in {"walk", "bus_connector"} and near_audible_signal_count:
+        weight *= 0.90
+    if edge_type in {"walk", "bus_connector"} and near_braille_count:
+        weight *= 0.88
     if data_confidence == "low":
         weight *= 1.25
     return round(weight, 3)
@@ -245,7 +258,7 @@ def main() -> int:
                 str(to_node_id),
             )
             near_braille = near_crosswalk = near_audible = 0
-            if edge_type in {"walk", "crosswalk", "facility_connector", "subway_connector"}:
+            if edge_type in {"walk", "crosswalk", "facility_connector", "subway_connector", "bus_connector"}:
                 geometry = json.loads(geometry_text)
                 points = line_points(geometry)
                 braille_ids: set[str] = set()
